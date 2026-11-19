@@ -17,6 +17,8 @@ import (
 
 	"b24bridge/internal/api"
 	"b24bridge/internal/bitrix"
+	"b24bridge/internal/inbox"
+	"b24bridge/internal/mcpserver"
 	"b24bridge/internal/webhook"
 )
 
@@ -91,18 +93,49 @@ func main() {
 		go b24.PersistCookies(ctx, f, 30*time.Second, log)
 	}
 
+	// Inbox: what matters to the user (direct, mentions, my task chats).
+	dbPath := os.Getenv("INBOX_DB")
+	if dbPath == "" {
+		dbPath = "inbox.db"
+	}
+	store, err := inbox.Open(dbPath)
+	if err != nil {
+		fatal("open inbox db", err)
+	}
+	defer store.Close()
+	in := inbox.New(store, b24, b24.UserID)
+	in.IncludeSystem = os.Getenv("INBOX_INCLUDE_SYSTEM") == "true"
+	in.OnNew = func(it inbox.Item) {
+		wh.Enqueue("inbox.new", false, map[string]any{
+			"event": "inbox.new", "timestamp": time.Now().UTC(), "portal": b24.Host(),
+			"user_id": b24.UserID(), "payload": it,
+		})
+	}
+	go in.Run(ctx)
+	backfill := 24 * time.Hour
+	if d, err := time.ParseDuration(os.Getenv("INBOX_BACKFILL")); err == nil {
+		backfill = d
+	}
+	if backfill > 0 {
+		go func() {
+			if err := in.Backfill(ctx, time.Now().Add(-backfill)); err != nil {
+				log.Warn("inbox backfill", "err", err)
+			}
+		}()
+	}
+
 	listener := &bitrix.Listener{
 		Client: b24,
 		Handle: func(ev bitrix.Event) {
-			log.Info("event", "event", ev.Event, "dialog", ev.Payload.DialogID, "message_id", ev.Payload.MessageID, "from_me", ev.Payload.IsFromMe)
-			if ev.Event != bitrix.EvMessage && ev.Event != bitrix.EvMessageEdited {
-				// Field names of read/typing commands are still being mapped.
-				log.Debug("event raw params", "event", ev.Event, "raw", string(ev.Raw))
-			}
+			log.Debug("event", "event", ev.Event, "dialog", ev.Payload.DialogID, "message_id", ev.Payload.MessageID, "from_me", ev.Payload.IsFromMe)
+			in.Enqueue(ev)
 			wh.Enqueue(ev.Event, ev.Payload.IsFromMe, ev)
 		},
 	}
 	go func() { _ = listener.Run(ctx) }()
+
+	directSend := os.Getenv("AGENT_SEND_MODE") == "direct"
+	mcpHandler := mcpserver.Handler(mcpserver.Deps{B24: b24, Inbox: in, DirectSend: directSend})
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
@@ -110,7 +143,7 @@ func main() {
 	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           (&api.Server{B24: b24, Listener: listener, Token: os.Getenv("API_TOKEN")}).Handler(),
+		Handler:           (&api.Server{B24: b24, Listener: listener, Token: os.Getenv("API_TOKEN"), Inbox: in, MCP: mcpHandler}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

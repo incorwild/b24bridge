@@ -58,6 +58,7 @@ type Payload struct {
 	MessageID int64  `json:"message_id,omitempty"`
 	SenderID  int64  `json:"sender_id,omitempty"`
 	IsFromMe  bool   `json:"is_from_me"`
+	System    bool   `json:"system,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Date      string `json:"date,omitempty"`
 	Reaction  string `json:"reaction,omitempty"`
@@ -129,11 +130,12 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		LastID     ID              `json:"lastId"`
 		Files      json.RawMessage `json:"files"`
 		Message    *struct {
-			ID       ID     `json:"id"`
-			ChatID   ID     `json:"chatId"`
-			SenderID ID     `json:"senderId"`
-			Date     string `json:"date"`
-			Text     string `json:"text"`
+			ID       ID              `json:"id"`
+			ChatID   ID              `json:"chatId"`
+			SenderID ID              `json:"senderId"`
+			System   json.RawMessage `json:"system"`
+			Date     string          `json:"date"`
+			Text     string          `json:"text"`
 		} `json:"message"`
 		Users map[string]struct {
 			ID   ID     `json:"id"`
@@ -157,6 +159,8 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		pl.SenderID = p.Message.SenderID.Int()
 		pl.Text = p.Message.Text
 		pl.Date = p.Message.Date
+		sys := string(p.Message.System)
+		pl.System = sys == `"Y"` || sys == "true" || pl.SenderID == 0
 		if pl.ChatID == 0 {
 			pl.ChatID = p.Message.ChatID.Int()
 		}

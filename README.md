@@ -62,6 +62,10 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 | `WEBHOOK_INCLUDE_OWN` | `true` — слать и события, вызванные самим аккаунтом (по умолчанию нет, чтобы бот не отвечал сам себе) |
 | `SESSION_KEEPALIVE` | период keepalive, по умолчанию `10m` |
 | `B24_COOKIE_READONLY` | `true` — не перезаписывать файл cookie |
+| `INBOX_DB` | файл SQLite, по умолчанию `inbox.db` |
+| `INBOX_BACKFILL` | глубина догрузки при старте, `24h`; `0` — выключить |
+| `INBOX_INCLUDE_SYSTEM` | `true` — брать служебные сообщения чатов задач |
+| `AGENT_SEND_MODE` | `direct` — дать агенту `send_message` без подтверждения |
 | `LISTEN_ADDR` | по умолчанию `127.0.0.1:3000` |
 | `API_TOKEN` | если задан, API требует `Authorization: Bearer <token>` |
 | `LOG_LEVEL` | `debug` — логировать и пропущенные служебные команды |
@@ -93,6 +97,56 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 Пока не проверено: `message.deleted`.
 Ответить можно сразу из обработчика: `POST /send/message` с `dialog_id` из события.
 
+## Inbox и агент
+
+Сервис сам отбирает сообщения, которые касаются вас, и складывает их в SQLite (`INBOX_DB`, по умолчанию `inbox.db`):
+
+| Метка | Когда |
+|---|---|
+| `direct` | вам написали в личку |
+| `mention` | в тексте есть `[USER=<ваш id>]` |
+| `task_responsible` / `task_accomplice` | сообщение в чате задачи (`entity_type = TASKS_TASK`), где вы исполнитель / соисполнитель |
+
+Свои сообщения, чат «с собой», общие чаты без упоминаний и служебные сообщения задач
+(последние — если не `INBOX_INCLUDE_SYSTEM=true`) не попадают. Если вы ответили в диалоге сами,
+его элементы закрываются. При старте сервис добирает пропущенное за `INBOX_BACKFILL` (24h):
+непрочитанные диалоги и чаты ваших задач с активностью; сообщения старше вашего последнего ответа
+в том же чате считаются обработанными. Каждый новый элемент — вебхук `inbox.new`.
+
+### MCP
+
+`http://127.0.0.1:3077/mcp` (streamable HTTP, тот же `API_TOKEN`). Инструменты:
+`inbox_list`, `inbox_done`, `chat_history`, `task_get`, `propose_reply`, `drafts_list`, `mark_read`;
+`send_message` — только при `AGENT_SEND_MODE=direct`.
+
+### Подтверждение ответов
+
+`propose_reply` ничего не отправляет адресату: черновик приходит вам в чат «с собой»:
+
+```
+🤖 Черновик #7 → задача «Отчёт» (Коллега)
+На сообщение: «когда будет готово?»
+
+Завтра до 12:00 пришлю.
+
+Ответьте: «ок 7» — отправить, «нет 7» — отменить, «7: другой текст» — отправить с правкой.
+```
+
+Ответ «ок 7» (или «да 7», «ok #7») отправляет, «нет 7» отменяет, «7: текст» отправляет ваш вариант.
+Повторное «ок» ничего не шлёт. Не начинайте свои заметки в чате с собой с «N:», если черновик N ждёт ответа.
+
+### Запуск агента (Claude Code)
+
+В `agent/` — промпт, конфиг MCP и скрипт одного прохода:
+
+```bash
+./agent/run.sh
+```
+
+Скрипт вызывает `claude -p` с `--mcp-config agent/mcp.json` и разрешает только инструменты inbox,
+истории, задач и черновиков. Запускайте по расписанию (cron/launchd, например раз в 10 минут)
+или по вебхуку `inbox.new`. Тексты переписки при этом уходят в Claude API.
+
 ## HTTP API
 
 | Метод | Путь | Что делает |
@@ -106,6 +160,10 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 | GET | `/chat/{dialog}/messages?limit=50&last_id=` | история |
 | POST | `/chat/{dialog}/read` | отметить прочитанным |
 | GET | `/chat/{dialog}/read-status?message_id=` | прочитали ли собеседники (`read`, `read_by`, `pending`) |
+| GET | `/inbox?status=new\|done\|all&limit=` | элементы inbox |
+| POST | `/inbox/done` | `{"ids":[1,2]}` |
+| GET / POST | `/drafts` | список / `{"dialog_id","text","inbox_id"}` — черновик на подтверждение |
+| — | `/mcp` | MCP для агентов |
 
 ## Устройство
 
@@ -122,7 +180,8 @@ internal/api         HTTP API
 ## Что дальше
 
 - Проверить вживую удаление сообщения (`messageDelete`) и поправить поля.
-- Хранилище (SQLite) для истории и offset, как `chatstorage` в оригинале.
 - Файлы: `im.disk.folder.get` → загрузка → `im.disk.file.commit`.
-- Несколько аккаунтов, MCP-сервер для агентов.
+- Несколько аккаунтов.
+- Ответы на ваши сообщения (reply) как ещё один повод попасть в inbox.
+- Запуск агента прямо по `inbox.new` с дебаунсом.
 - Поддержка push-сервера v5 (JSON-RPC), если портал на него переедет.

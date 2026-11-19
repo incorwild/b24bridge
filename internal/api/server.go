@@ -13,12 +13,15 @@ import (
 	"time"
 
 	"b24bridge/internal/bitrix"
+	"b24bridge/internal/inbox"
 )
 
 type Server struct {
 	B24      *bitrix.Client
 	Listener *bitrix.Listener
 	Token    string // optional bearer token
+	Inbox    *inbox.Inbox
+	MCP      http.Handler // mounted at /mcp when set
 }
 
 func (s *Server) Handler() http.Handler {
@@ -32,6 +35,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /chat/{dialog}/messages", s.messages)
 	mux.HandleFunc("POST /chat/{dialog}/read", s.read)
 	mux.HandleFunc("GET /chat/{dialog}/read-status", s.readStatus)
+	if s.Inbox != nil {
+		mux.HandleFunc("GET /inbox", s.inboxList)
+		mux.HandleFunc("POST /inbox/done", s.inboxDone)
+		mux.HandleFunc("GET /drafts", s.draftsList)
+		mux.HandleFunc("POST /drafts", s.draftCreate)
+	}
+	if s.MCP != nil {
+		mux.Handle("/mcp", s.MCP)
+	}
 	return s.auth(mux)
 }
 
@@ -50,6 +62,11 @@ func (s *Server) auth(next http.Handler) http.Handler {
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"portal": s.B24.Host(), "user_id": s.B24.UserID(), "session": s.B24.Session()}
+	if s.Inbox != nil {
+		if n, err := s.Inbox.Store.CountNew(r.Context()); err == nil {
+			resp["inbox_new"] = n
+		}
+	}
 	if s.Listener != nil {
 		resp["pull_connected"] = s.Listener.Connected()
 		if t := s.Listener.LastEventAt(); !t.IsZero() {
@@ -212,4 +229,63 @@ func writeB24Err(w http.ResponseWriter, err error) {
 	default:
 		writeErr(w, http.StatusBadGateway, err.Error())
 	}
+}
+
+func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
+	st := r.URL.Query().Get("status")
+	switch st {
+	case "":
+		st = "new"
+	case "all":
+		st = ""
+	}
+	items, err := s.Inbox.Store.List(r.Context(), st, queryInt(r, "limit", 50))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) inboxDone(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.IDs) == 0 {
+		writeErr(w, http.StatusBadRequest, `body must be {"ids": [1, 2]}`)
+		return
+	}
+	n, err := s.Inbox.Store.Done(r.Context(), req.IDs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"done": n})
+}
+
+func (s *Server) draftsList(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.Inbox.Store.ListDrafts(r.Context(), r.URL.Query().Get("status"), queryInt(r, "limit", 50))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"drafts": ds})
+}
+
+func (s *Server) draftCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DialogID string `json:"dialog_id"`
+		Text     string `json:"text"`
+		InboxID  int64  `json:"inbox_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d, err := s.Inbox.ProposeReply(r.Context(), req.DialogID, req.Text, req.InboxID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
 }

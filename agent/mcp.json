@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "b24": {
+      "type": "http",
+      "url": "http://127.0.0.1:3077/mcp",
+      "headers": { "Authorization": "Bearer ${B24_API_TOKEN}" }
+    }
+  }
+}
