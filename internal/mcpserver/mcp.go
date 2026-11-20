@@ -246,8 +246,11 @@ func (h *handlers) chatsList(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	}
 	// Task chats are not in the recent list.
 	me := h.d.B24.UserID()
+	var warning string
 	tasks, err := h.d.B24.MyActiveTasks(ctx, me, time.Now().AddDate(0, 0, -30))
-	if err == nil {
+	if err != nil {
+		warning = "task chats are missing: " + err.Error()
+	} else {
 		for _, t := range tasks {
 			if t.ChatID.Int() == 0 {
 				continue
@@ -265,7 +268,11 @@ func (h *handlers) chatsList(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	if out == nil {
 		out = []chatInfo{}
 	}
-	return mcp.NewToolResultStructured(map[string]any{"chats": out}, fmt.Sprintf("%d chat(s)", len(out))), nil
+	res := map[string]any{"chats": out}
+	if warning != "" {
+		res["warning"] = warning
+	}
+	return mcp.NewToolResultStructured(res, fmt.Sprintf("%d chat(s)", len(out))), nil
 }
 
 // dialogArg accepts dialog_id as a string ("88", "chat5986") or a number

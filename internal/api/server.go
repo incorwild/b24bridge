@@ -134,9 +134,12 @@ func (s *Server) setCookies(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "send the browser Cookie header")
 		return
 	}
-	s.B24.ReplaceCookies(cookie)
-	if err := s.B24.RefreshSession(r.Context()); err != nil {
-		writeB24Err(w, err)
+	if err := s.B24.SwapCookies(r.Context(), cookie); err != nil {
+		if errors.Is(err, bitrix.ErrOtherUser) {
+			writeErr(w, http.StatusConflict, err.Error()+"; the bridge and its inbox belong to user "+strconv.FormatInt(s.B24.UserID(), 10))
+			return
+		}
+		writeB24Err(w, err) // the previous cookies are still in use
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"user_id": s.B24.UserID(), "session": s.B24.Session()})

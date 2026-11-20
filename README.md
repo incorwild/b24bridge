@@ -47,6 +47,8 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookies.txt API_TOKEN=$(o
   push-подписка ждёт. Войдите в браузере и отправьте новый Cookie:
   `curl -X POST localhost:3077/session/cookies -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' --data-binary @cookies.txt` —
   сервис продолжит без перезапуска и пришлёт `session.restored`.
+  Если cookie не подошли или принадлежат другому пользователю (ответ `409`), сервис
+  продолжит работать на прежних — неудачная вставка сессию не ломает.
 - Если cookie не годятся уже при старте — сервис завершается с ошибкой.
 
 ### Переменные окружения

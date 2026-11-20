@@ -313,7 +313,7 @@ func (in *Inbox) RecoverSending(ctx context.Context) error {
 			for _, m := range h.Messages {
 				t, _ := time.Parse(time.RFC3339, m.Date)
 				if m.AuthorID == me && !t.Before(created.Add(-time.Minute)) &&
-					strings.TrimSpace(html.UnescapeString(m.Text)) == strings.TrimSpace(d.Text) {
+					sameText(m.Text, d.Text) {
 					sentID = m.ID
 					break
 				}
@@ -402,4 +402,11 @@ func withAttachment(text string, files bool) string {
 	default:
 		return text + " [+вложение]"
 	}
+}
+
+// sameText compares a sent draft with a message from history, ignoring the
+// formatting and whitespace Bitrix24 may add (auto-links, BB-codes, entities).
+func sameText(fromHistory, draft string) bool {
+	norm := func(t string) string { return strings.Join(strings.Fields(PlainText(html.UnescapeString(t))), " ") }
+	return norm(fromHistory) == norm(draft)
 }

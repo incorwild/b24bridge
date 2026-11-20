@@ -25,6 +25,12 @@ func (s *swapJar) swap(j *cookiejar.Jar) {
 	s.mu.Unlock()
 }
 
+func (s *swapJar) current() *cookiejar.Jar {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.jar
+}
+
 func (s *swapJar) SetCookies(u *url.URL, cs []*http.Cookie) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -35,6 +41,45 @@ func (s *swapJar) Cookies(u *url.URL) []*http.Cookie {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.jar.Cookies(u)
+}
+
+// ErrOtherUser means new cookies sign in as a different Bitrix24 user than
+// the one the bridge (and its inbox) belongs to.
+var ErrOtherUser = errors.New("bitrix24: these cookies belong to another user")
+
+// SwapCookies tries a new cookie set and keeps it only if it signs in as the
+// same user. On failure the previous cookies, sessid and state stay as they
+// were, so a wrong paste cannot log a working bridge out.
+func (c *Client) SwapCookies(ctx context.Context, header string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	oldJar := c.jar.current()
+	c.mu.RLock()
+	oldSess, oldUID := c.sessid, c.userID
+	c.mu.RUnlock()
+	restore := func() {
+		c.jar.swap(oldJar)
+		c.mu.Lock()
+		c.sessid, c.userID = oldSess, oldUID
+		c.mu.Unlock()
+	}
+
+	c.ReplaceCookies(header)
+	err := c.loadSession(ctx)
+	if errors.Is(err, ErrUnauthorized) {
+		c.dropCookie("PHPSESSID")
+		err = c.loadSession(ctx)
+	}
+	if err == nil && oldUID != 0 && c.UserID() != oldUID {
+		err = ErrOtherUser
+	}
+	if err != nil {
+		restore()
+		return err
+	}
+	c.auth.set(nil)
+	return nil
 }
 
 // SessionState is what /healthz and webhooks report about the login.

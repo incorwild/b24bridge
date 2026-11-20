@@ -112,6 +112,12 @@ type fakePortal struct {
 	logins   atomic.Int32 // sessions created from UIDH
 	calls    atomic.Int32
 	wsFrames []string
+	// perConn, when set, gives each websocket connection its own frames; the
+	// server drops every connection but the last one after sending them.
+	perConn  [][]string
+	conns    atomic.Int32
+	cfgCalls atomic.Int32
+	mids     chan string // "mid" query param of each connection
 }
 
 func newFakePortal(t *testing.T) *fakePortal {
@@ -167,6 +173,7 @@ func newFakePortal(t *testing.T) *fakePortal {
 		case "im.dialog.get":
 			fmt.Fprint(w, `{"result":{"last_message_id":338282,"readed_list":[{"user_id":88,"user_name":"C","message_id":337392},{"user_id":54,"message_id":338282}]}}`)
 		case "pull.config.get":
+			f.cfgCalls.Add(1)
 			ws := "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/subws2/"
 			fmt.Fprintf(w, `{"result":{"server":{"version":4,"mode":"personal","websocket_secure":%q},"api":{"revision_web":19},"channels":{"private":{"id":"P"},"shared":{"id":"S"}}}}`, ws)
 		default:
@@ -183,8 +190,20 @@ func newFakePortal(t *testing.T) *fakePortal {
 			return
 		}
 		defer c.CloseNow()
-		for _, fr := range f.wsFrames {
+		n := int(f.conns.Add(1)) - 1
+		if f.mids != nil {
+			f.mids <- r.URL.Query().Get("mid")
+		}
+		frames := f.wsFrames
+		if f.perConn != nil && n < len(f.perConn) {
+			frames = f.perConn[n]
+		}
+		for _, fr := range frames {
 			_ = c.Write(r.Context(), websocket.MessageText, []byte(fr))
+		}
+		if f.perConn != nil && n < len(f.perConn)-1 {
+			c.Close(websocket.StatusGoingAway, "server restart")
+			return
 		}
 		<-r.Context().Done()
 	})
@@ -403,5 +422,66 @@ func TestNormalizeBotSender(t *testing.T) {
 	ev, _ := Normalize(ParseFrame([]byte(fr))[0], 54)
 	if ev.Payload.Sender == nil || !ev.Payload.Sender.Bot {
 		t.Fatalf("bot flag lost: %+v", ev.Payload.Sender)
+	}
+}
+
+// The push server drops the connection: the listener must fetch a fresh
+// config, reconnect with the last mid, and keep delivering events.
+func TestListenerReconnects(t *testing.T) {
+	f := newFakePortal(t)
+	second := strings.Replace(frameTwo, `"mid":"m1"`, `"mid":"m3"`, 1)
+	second = strings.Replace(second, `"mid":"m2"`, `"mid":"m4"`, 1)
+	f.perConn = [][]string{{frameMessage}, {second}}
+	f.mids = make(chan string, 4)
+	c := newTestClient(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = c.RefreshSession(ctx)
+
+	got := make(chan Event, 10)
+	l := &Listener{Client: c, Handle: func(e Event) { got <- e }}
+	go l.Run(ctx)
+
+	var names []string
+	for len(names) < 2 {
+		select {
+		case e := <-got:
+			names = append(names, e.Event)
+		case <-ctx.Done():
+			t.Fatalf("timeout, got %v", names)
+		}
+	}
+	if names[0] != EvMessage || names[1] != EvReaction {
+		t.Fatalf("events %v", names)
+	}
+	if f.conns.Load() < 2 || f.cfgCalls.Load() < 2 {
+		t.Fatalf("conns=%d config calls=%d", f.conns.Load(), f.cfgCalls.Load())
+	}
+	if m1, m2 := <-f.mids, <-f.mids; m1 != "" || m2 != "a1b2" {
+		t.Fatalf("mid on connect: first %q, reconnect %q (want the last seen mid)", m1, m2)
+	}
+}
+
+// KeepAlive notices a dead PHP session and revives it via remember-me
+// cookies without any API traffic from the user.
+func TestKeepAliveRevivesSession(t *testing.T) {
+	f := newFakePortal(t)
+	c := newTestClient(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.RefreshSession(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.phpsess.Store("dead")
+	go c.KeepAlive(ctx, 20*time.Millisecond, nil)
+	for f.logins.Load() == 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("keepalive did not revive the session")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !c.Session().Authorized || !strings.Contains(c.CookieHeader(), "PHPSESSID=new1") {
+		t.Fatalf("state %+v cookies %s", c.Session(), c.CookieHeader())
 	}
 }

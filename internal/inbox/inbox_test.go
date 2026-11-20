@@ -417,3 +417,32 @@ func TestResolverCacheBounded(t *testing.T) {
 		t.Fatalf("cache grew to %d", n)
 	}
 }
+
+func TestRunQueue(t *testing.T) {
+	in, _ := newTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go in.Run(ctx)
+	in.Enqueue(bitrix.Event{Event: bitrix.EvChatPresence, Payload: bitrix.Payload{DialogID: "88", UserID: 88}}) // ignored
+	in.Enqueue(msg(1, "88", 88, "привет"))
+	deadline := time.After(2 * time.Second)
+	for {
+		if n, _ := in.Store.CountNew(ctx); n == 1 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("queued message not processed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestSameText(t *testing.T) {
+	if !sameText("Ссылка: [URL=https://x.ru]https://x.ru[/URL] &amp; всё", "Ссылка: https://x.ru & всё") {
+		t.Fatal("auto-linked text should match the draft")
+	}
+	if sameText("другой текст", "Ссылка") {
+		t.Fatal("different texts matched")
+	}
+}
