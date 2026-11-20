@@ -140,6 +140,30 @@ func (s *Store) Get(ctx context.Context, id int64) (Item, error) {
 	return scanItem(s.db.QueryRowContext(ctx, `SELECT `+itemCols+` FROM items WHERE id = ?`, id))
 }
 
+// ListDialog returns a dialog's items oldest first, filtered by status ("" = all).
+func (s *Store) ListDialog(ctx context.Context, dialogID, status string) ([]Item, error) {
+	q := `SELECT ` + itemCols + ` FROM items WHERE dialog_id = ?`
+	args := []any{dialogID}
+	if status != "" {
+		q += ` AND status = ?`
+		args = append(args, status)
+	}
+	rows, err := s.db.QueryContext(ctx, q+` ORDER BY message_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Item{}
+	for rows.Next() {
+		it, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // Done marks items as handled. It returns how many changed.
 func (s *Store) Done(ctx context.Context, ids []int64) (int64, error) {
 	if len(ids) == 0 {

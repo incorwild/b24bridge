@@ -34,6 +34,7 @@ func Handler(d Deps) http.Handler {
 		mcp.WithDescription("Messages that need the user's attention: direct messages, mentions of the user, and messages in chats of tasks where the user is responsible or accomplice. Oldest first."),
 		mcp.WithString("status", mcp.Description("new (default), done or all"), mcp.Enum("new", "done", "all")),
 		mcp.WithNumber("limit", mcp.Description("max items, default 30")),
+		mcp.WithBoolean("include_settling", mcp.Description("also return dialogs where messages are still arriving (by default they are held back until the sender pauses)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	), h.inboxList)
 	s.AddTool(mcp.NewTool("inbox_done",
@@ -78,7 +79,7 @@ func Handler(d Deps) http.Handler {
 }
 
 const instructions = `You work through the user's Bitrix24 messenger.
-Start with inbox_list. For each item, read chat_history (and task_get for task chats) before deciding.
+Start with inbox_list. People often split one thought into several messages; handle all new items of a dialog together and answer once. For each dialog, read chat_history (and task_get for task chats) before deciding.
 Reply with propose_reply: the user approves every reply in their own chat, so write the final text, in Russian unless the conversation is in another language, in the user's voice, without mentioning that you are an AI.
 Close items that need no answer (thanks, FYI, service notices) with inbox_done.
 Never invent facts, deadlines or promises; if the answer needs information you do not have, draft a short reply that asks for it or leave the item for the user.`
@@ -94,7 +95,7 @@ func (h *handlers) inboxList(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	if st == "all" {
 		st = ""
 	}
-	items, err := h.d.Inbox.Store.List(ctx, st, r.GetInt("limit", 30))
+	items, err := h.d.Inbox.List(ctx, st, r.GetInt("limit", 30), r.GetBool("include_settling", false))
 	if err != nil {
 		return errResult(err)
 	}

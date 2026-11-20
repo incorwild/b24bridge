@@ -32,6 +32,7 @@ type Inbox struct {
 	Log      *slog.Logger
 
 	queue chan bitrix.Event
+	batch *Batcher
 }
 
 func New(store *Store, portal Portal, me func() int64) *Inbox {
@@ -80,6 +81,9 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 			return in.command(ctx, p.Text)
 		}
 		// The user answered by hand: whatever waited in that dialog is handled.
+		if in.batch != nil {
+			in.batch.Cancel(p.DialogID)
+		}
 		return in.Store.DoneDialog(ctx, p.DialogID)
 	}
 	meta, err := in.Resolver.Meta(ctx, p.DialogID)
@@ -113,6 +117,9 @@ func (in *Inbox) add(ctx context.Context, it *Item) error {
 		return err
 	}
 	in.Log.Info("inbox: new", "id", it.ID, "labels", strings.Join(it.Labels, ","), "dialog", it.DialogID)
+	if in.batch != nil {
+		in.batch.Add(it.DialogID)
+	}
 	if in.OnNew != nil {
 		in.OnNew(*it)
 	}

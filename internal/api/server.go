@@ -239,7 +239,7 @@ func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
 	case "all":
 		st = ""
 	}
-	items, err := s.Inbox.Store.List(r.Context(), st, queryInt(r, "limit", 50))
+	items, err := s.Inbox.List(r.Context(), st, queryInt(r, "limit", 50), r.URL.Query().Get("include_settling") == "true")
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

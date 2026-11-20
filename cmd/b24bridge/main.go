@@ -119,6 +119,22 @@ func main() {
 			"user_id": b24.UserID(), "payload": it,
 		})
 	}
+	// Bursts of messages in one dialog are reported once the sender pauses.
+	batchWindow, batchMax := 3*time.Minute, 10*time.Minute
+	if d, err := time.ParseDuration(os.Getenv("INBOX_BATCH_WINDOW")); err == nil {
+		batchWindow = d
+	}
+	if d, err := time.ParseDuration(os.Getenv("INBOX_BATCH_MAX")); err == nil && d > 0 {
+		batchMax = d
+	}
+	if batchWindow > 0 {
+		in.EnableBatching(ctx, batchWindow, batchMax, func(b inbox.Batch) {
+			wh.Enqueue("inbox.batch", false, map[string]any{
+				"event": "inbox.batch", "timestamp": time.Now().UTC(), "portal": b24.Host(),
+				"user_id": b24.UserID(), "payload": b,
+			})
+		})
+	}
 	go in.Run(ctx)
 	backfill := 24 * time.Hour
 	if d, err := time.ParseDuration(os.Getenv("INBOX_BACKFILL")); err == nil {
