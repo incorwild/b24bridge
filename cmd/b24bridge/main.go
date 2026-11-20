@@ -104,7 +104,15 @@ func main() {
 	}
 	defer store.Close()
 	in := inbox.New(store, b24, b24.UserID)
-	in.IncludeSystem = os.Getenv("INBOX_INCLUDE_SYSTEM") == "true"
+	in.Filter, err = inbox.ParseFilter(
+		os.Getenv("INBOX_INCLUDE_SYSTEM") == "true",
+		os.Getenv("INBOX_IGNORE_BOTS") != "false",
+		os.Getenv("INBOX_IGNORE_SENDERS"),
+		os.Getenv("INBOX_IGNORE_TEXT"),
+	)
+	if err != nil {
+		fatal("inbox filter", err)
+	}
 	in.OnNew = func(it inbox.Item) {
 		wh.Enqueue("inbox.new", false, map[string]any{
 			"event": "inbox.new", "timestamp": time.Now().UTC(), "portal": b24.Host(),
@@ -124,11 +132,15 @@ func main() {
 		}()
 	}
 
+	skipSystemWebhooks := os.Getenv("WEBHOOK_INCLUDE_SYSTEM") != "true"
 	listener := &bitrix.Listener{
 		Client: b24,
 		Handle: func(ev bitrix.Event) {
 			log.Debug("event", "event", ev.Event, "dialog", ev.Payload.DialogID, "message_id", ev.Payload.MessageID, "from_me", ev.Payload.IsFromMe)
 			in.Enqueue(ev)
+			if ev.Payload.System && skipSystemWebhooks {
+				return // service notices ("task created", "deadline changed") are not for agents
+			}
 			wh.Enqueue(ev.Event, ev.Payload.IsFromMe, ev)
 		},
 	}

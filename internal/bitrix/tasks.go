@@ -99,6 +99,17 @@ type HistoryMessage struct {
 type HistoryUser struct {
 	ID   ID     `json:"id"`
 	Name string `json:"name"`
+	Bot  bool   `json:"bot"`
+}
+
+// IsBot reports whether id is a chat bot according to the history's users.
+func (h History) IsBot(id int64) bool {
+	for _, u := range h.Users {
+		if u.ID.Int() == id {
+			return u.Bot
+		}
+	}
+	return false
 }
 
 type History struct {

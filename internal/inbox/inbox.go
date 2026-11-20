@@ -23,13 +23,13 @@ type Portal interface {
 }
 
 type Inbox struct {
-	Store         *Store
-	Portal        Portal
-	Resolver      *Resolver
-	Me            func() int64
-	IncludeSystem bool       // keep service messages of task chats
-	OnNew         func(Item) // e.g. webhook "inbox.new"
-	Log           *slog.Logger
+	Store    *Store
+	Portal   Portal
+	Resolver *Resolver
+	Me       func() int64
+	Filter   Filter     // what never reaches the agent
+	OnNew    func(Item) // e.g. webhook "inbox.new"
+	Log      *slog.Logger
 
 	queue chan bitrix.Event
 }
@@ -87,7 +87,12 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 		in.Log.Warn("inbox: chat info", "dialog", p.DialogID, "err", err)
 		meta = ChatMeta{Private: IsPrivateDialog(p.DialogID)}
 	}
-	labels := Labels(p.DialogID, p.SenderID, p.Text, p.System, meta, me, in.IncludeSystem)
+	bot := p.Sender != nil && p.Sender.Bot
+	if reason := in.Filter.Skip(p.SenderID, bot, p.Text); reason != "" {
+		in.Log.Debug("inbox: filtered", "reason", reason, "message_id", p.MessageID)
+		return nil
+	}
+	labels := Labels(p.DialogID, p.SenderID, p.Text, p.System, meta, me, in.Filter.IncludeSystem)
 	if len(labels) == 0 {
 		return nil
 	}
@@ -166,7 +171,10 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 			if t, err := time.Parse(time.RFC3339, m.Date); err == nil && t.Before(since) {
 				continue
 			}
-			labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, meta, me, in.IncludeSystem)
+			if in.Filter.Skip(m.AuthorID, h.IsBot(m.AuthorID), m.Text) != "" {
+				continue
+			}
+			labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, meta, me, in.Filter.IncludeSystem)
 			if len(labels) == 0 {
 				continue
 			}

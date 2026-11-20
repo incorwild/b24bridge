@@ -397,3 +397,11 @@ func TestPersistCookies(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeBotSender(t *testing.T) {
+	fr := strings.Replace(frameMessage, `"88":{"id":88,"name":"Colleague"}`, `"88":{"id":88,"name":"CRM","bot":true}`, 1)
+	ev, _ := Normalize(ParseFrame([]byte(fr))[0], 54)
+	if ev.Payload.Sender == nil || !ev.Payload.Sender.Bot {
+		t.Fatalf("bot flag lost: %+v", ev.Payload.Sender)
+	}
+}

@@ -76,6 +76,7 @@ type Payload struct {
 type UserBrief struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+	Bot  bool   `json:"bot,omitempty"`
 }
 
 // Event names. Commands marked "unverified" were not observed on a live
@@ -140,6 +141,7 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		Users map[string]struct {
 			ID   ID     `json:"id"`
 			Name string `json:"name"`
+			Bot  bool   `json:"bot"`
 		} `json:"users"`
 		ActualReactions *struct {
 			Reaction struct {
@@ -165,7 +167,7 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 			pl.ChatID = p.Message.ChatID.Int()
 		}
 		if u, ok := p.Users[string(p.Message.SenderID)]; ok {
-			pl.Sender = &UserBrief{ID: pl.SenderID, Name: u.Name}
+			pl.Sender = &UserBrief{ID: pl.SenderID, Name: u.Name, Bot: u.Bot}
 		}
 		if len(p.Files) > 0 && string(p.Files) != "[]" && string(p.Files) != "{}" {
 			pl.Files = p.Files

@@ -158,7 +158,7 @@ func TestSystemMessagesInTaskChats(t *testing.T) {
 	if len(labelsOf(t, in)) != 0 {
 		t.Fatal("system message stored by default")
 	}
-	in.IncludeSystem = true
+	in.Filter.IncludeSystem = true
 	ev.Payload.MessageID = 2
 	_ = in.Handle(context.Background(), ev)
 	if labelsOf(t, in)[2] != "task_responsible" {
@@ -280,5 +280,71 @@ func TestAttachments(t *testing.T) {
 	}
 	if withAttachment("", true) != "[вложение]" || withAttachment("см.", true) != "см. [+вложение]" || withAttachment("x", false) != "x" {
 		t.Fatal("withAttachment")
+	}
+}
+
+// Service messages as seen in real task chats (2026-11-20): author 0, and
+// often a mention of the user. None of them may reach the agent by default.
+func TestTaskServiceMessagesIgnored(t *testing.T) {
+	in, _ := newTest(t)
+	ctx := context.Background()
+	for i, text := range []string{
+		"[USER=20]Иван[/USER] создал [URL=/workgroups/group/30/tasks/task/view/5314/]задачу[/URL]",
+		"[USER=20]Иван[/USER] изменил исполнителя на [USER=54]Пётр[/USER]",
+		"[USER=20]Иван[/USER] добавил соисполнителя [USER=54]Пётр[/USER]",
+		"[USER=54]Пётр[/USER], задача просрочена",
+		"[USER=86]Анна[/USER] изменил стадию на ПАУЗА",
+	} {
+		ev := msg(int64(100+i), "chat5986", 0, text)
+		ev.Payload.System = true
+		if err := in.Handle(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := labelsOf(t, in); len(got) != 0 {
+		t.Fatalf("service messages reached the inbox: %v", got)
+	}
+}
+
+func TestFilterBotsSendersText(t *testing.T) {
+	in, _ := newTest(t)
+	ctx := context.Background()
+	f, err := ParseFilter(false, true, "77, 78", `^напоминание:`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Filter = f
+
+	bot := msg(1, "300", 300, "Ваш отчёт готов")
+	bot.Payload.Sender.Bot = true
+	_ = in.Handle(ctx, bot)                                       // bot in a private chat
+	_ = in.Handle(ctx, msg(2, "77", 77, "привет"))                // ignored sender
+	_ = in.Handle(ctx, msg(3, "88", 88, "Напоминание: планёрка")) // ignored text, any case
+	_ = in.Handle(ctx, msg(4, "88", 88, "а напоминание где?"))    // regex anchored: kept
+	got := labelsOf(t, in)
+	if fmt.Sprint(got) != "map[4:direct]" {
+		t.Fatalf("got %v", got)
+	}
+
+	if _, err := ParseFilter(false, true, "x", ""); err == nil {
+		t.Fatal("bad sender id must fail")
+	}
+	if _, err := ParseFilter(false, true, "", "("); err == nil {
+		t.Fatal("bad regexp must fail")
+	}
+}
+
+func TestBackfillSkipsBots(t *testing.T) {
+	in, fp := newTest(t)
+	in.Filter.IgnoreBots = true
+	now := time.Now().Format(time.RFC3339)
+	fp.unread = []bitrix.RecentItem{{ID: "300", Counter: 1}}
+	fp.hist["300"] = bitrix.History{
+		Users:    []bitrix.HistoryUser{{ID: "300", Name: "CRM-бот", Bot: true}},
+		Messages: []bitrix.HistoryMessage{{ID: 1, AuthorID: 300, Date: now, Text: "Новый лид"}},
+	}
+	_ = in.Backfill(context.Background(), time.Now().Add(-time.Hour))
+	if got := labelsOf(t, in); len(got) != 0 {
+		t.Fatalf("bot message in inbox: %v", got)
 	}
 }
