@@ -150,8 +150,14 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookies.txt API_TOKEN=$(o
 ### MCP
 
 `http://127.0.0.1:3077/mcp` (streamable HTTP, тот же `API_TOKEN`). Инструменты:
-`inbox_list`, `inbox_done`, `chat_history`, `task_get`, `propose_reply`, `drafts_list`, `mark_read`;
+`inbox_list`, `inbox_done`, `chat_history`, `chats_list`, `task_get`, `propose_reply`, `drafts_list`, `mark_read`;
 `send_message` — только при `AGENT_SEND_MODE=direct`.
+
+- `chat_history` читает любой доступный вам диалог, не только из inbox: последние `limit`
+  сообщений (до 200), дальше назад — с `before_id` = `next_before_id`, пока `has_more`.
+  `dialog_id` можно передавать строкой или числом.
+- `chats_list` ищет, что почитать: недавние чаты и чаты ваших задач за 30 дней,
+  фильтр `query` по названию/имени, `unread_only`.
 
 ### Подтверждение ответов
 

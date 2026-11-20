@@ -383,6 +383,12 @@ func excerpt(s string, n int) string {
 
 var reFileID = regexp.MustCompile(`"FILE_ID"\s*:\s*\[\s*"?\d`)
 
+// MessageText is the agent-facing text of a stored message: BB-codes
+// stripped, attachments marked.
+func MessageText(text string, params []byte) string {
+	return withAttachment(PlainText(text), hasFiles(params))
+}
+
 // hasFiles reports whether history params carry attachments (FILE_ID: [..]).
 func hasFiles(params []byte) bool { return reFileID.Match(params) }
 

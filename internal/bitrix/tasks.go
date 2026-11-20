@@ -130,8 +130,18 @@ func (h History) UserName(id int64) string {
 
 // DialogHistory is DialogMessages decoded; newest messages first.
 func (c *Client) DialogHistory(ctx context.Context, dialogID string, limit int) (History, error) {
+	return c.DialogHistoryBefore(ctx, dialogID, limit, 0)
+}
+
+// DialogHistoryBefore pages backwards: messages older than beforeID
+// (im.dialog.messages.get LAST_ID; checked on a portal), newest first.
+func (c *Client) DialogHistoryBefore(ctx context.Context, dialogID string, limit int, beforeID int64) (History, error) {
+	p := vals("DIALOG_ID", dialogID, "LIMIT", strconv.Itoa(limit))
+	if beforeID > 0 {
+		p["LAST_ID"] = []string{strconv.FormatInt(beforeID, 10)}
+	}
 	var h History
-	err := c.Call(ctx, "im.dialog.messages.get", vals("DIALOG_ID", dialogID, "LIMIT", strconv.Itoa(limit)), &h)
+	err := c.Call(ctx, "im.dialog.messages.get", p, &h)
 	return h, err
 }
 
@@ -140,6 +150,25 @@ type RecentItem struct {
 	Type    string `json:"type"`
 	Title   string `json:"title"`
 	Counter int    `json:"counter"`
+	Message struct {
+		ID       ID     `json:"id"`
+		Text     string `json:"text"`
+		Date     string `json:"date"`
+		AuthorID ID     `json:"author_id"`
+	} `json:"message"`
+}
+
+// RecentChats returns the user's recent dialogs (up to 200), newest first.
+// Task chats are not in this list; see MyActiveTasks.
+func (c *Client) RecentChats(ctx context.Context, limit int) ([]RecentItem, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	var out struct {
+		Items []RecentItem `json:"items"`
+	}
+	err := c.Call(ctx, "im.recent.list", vals("LIMIT", strconv.Itoa(limit)), &out)
+	return out.Items, err
 }
 
 // UnreadDialogs returns dialogs from the recent list with unread messages.
