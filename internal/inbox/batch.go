@@ -22,6 +22,7 @@ type Batcher struct {
 type pending struct {
 	first time.Time
 	timer *time.Timer
+	gen   uint64 // bumped on every Add; a timer only fires for its own gen
 }
 
 // Add records a new message in dialogID and (re)starts its quiet timer.
@@ -47,16 +48,18 @@ func (b *Batcher) Add(dialogID string) {
 		wait = 0
 	}
 	if p.timer != nil {
-		p.timer.Stop()
+		p.timer.Stop() // may be too late if it already fired; gen covers that
 	}
-	p.timer = time.AfterFunc(wait, func() { b.fire(dialogID, p) })
+	p.gen++
+	gen := p.gen
+	p.timer = time.AfterFunc(wait, func() { b.fire(dialogID, p, gen) })
 }
 
-func (b *Batcher) fire(dialogID string, p *pending) {
+func (b *Batcher) fire(dialogID string, p *pending, gen uint64) {
 	b.mu.Lock()
-	if b.pend[dialogID] != p {
+	if b.pend[dialogID] != p || p.gen != gen {
 		b.mu.Unlock()
-		return // superseded or cancelled
+		return // superseded by a newer message, or cancelled
 	}
 	delete(b.pend, dialogID)
 	b.mu.Unlock()
@@ -101,9 +104,13 @@ type Batch struct {
 	TaskID    int64    `json:"task_id,omitempty"`
 	TaskTitle string   `json:"task_title,omitempty"`
 	Labels    []string `json:"labels"`
-	Items     []Item   `json:"items"`
-	// Text joins the messages in order, one per line, prefixed by sender.
+	// Items are the messages new since the previous batch of this dialog.
+	Items []Item `json:"items"`
+	// Text joins Items in order, one per line, prefixed by sender.
 	Text string `json:"text"`
+	// Earlier are still-unanswered items already sent in a previous batch:
+	// context only, the agent has seen them (and may have a draft pending).
+	Earlier []Item `json:"earlier,omitempty"`
 }
 
 // EnableBatching makes the inbox report settled dialogs through OnBatch
@@ -116,10 +123,28 @@ func (in *Inbox) EnableBatching(ctx context.Context, window, max time.Duration, 
 			in.Log.Error("inbox: batch flush", "dialog", dialogID, "err", err)
 			return
 		}
-		if len(items) == 0 {
-			return // answered or closed meanwhile
+		var fresh, earlier []Item
+		for _, it := range items {
+			if it.Batched {
+				earlier = append(earlier, it)
+			} else {
+				fresh = append(fresh, it)
+			}
 		}
-		b := MakeBatch(items)
+		if len(fresh) == 0 {
+			return // answered, closed or already delivered meanwhile
+		}
+		ids := make([]int64, len(fresh))
+		for i, it := range fresh {
+			ids[i] = it.ID
+		}
+		if err := in.Store.MarkBatched(ctx, ids); err != nil {
+			in.Log.Error("inbox: mark batched", "dialog", dialogID, "err", err)
+			return
+		}
+		b := MakeBatch(fresh)
+		b.Earlier = earlier
+		items = fresh
 		in.Log.Info("inbox: batch", "dialog", dialogID, "items", len(items))
 		if onBatch != nil {
 			onBatch(b)

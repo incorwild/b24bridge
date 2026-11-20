@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,9 +20,14 @@ import (
 type Server struct {
 	B24      *bitrix.Client
 	Listener *bitrix.Listener
-	Token    string // optional bearer token
-	Inbox    *inbox.Inbox
-	MCP      http.Handler // mounted at /mcp when set
+	// Token is required: with an empty token every request except /healthz
+	// is refused (fail closed).
+	Token string
+	// AllowedHosts are extra Host header values accepted besides localhost
+	// (e.g. a tunnel hostname). Checking Host stops DNS-rebinding pages.
+	AllowedHosts []string
+	Inbox        *inbox.Inbox
+	MCP          http.Handler // mounted at /mcp when set
 }
 
 func (s *Server) Handler() http.Handler {
@@ -44,20 +50,52 @@ func (s *Server) Handler() http.Handler {
 	if s.MCP != nil {
 		mux.Handle("/mcp", s.MCP)
 	}
-	return s.auth(mux)
+	return s.guard(mux)
 }
 
-func (s *Server) auth(next http.Handler) http.Handler {
+// guard defends the API against other local programs and, above all, web
+// pages in the user's browser: a page can POST to 127.0.0.1 without CORS
+// preflight (text/plain) and, with DNS rebinding, even read responses.
+func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" && r.URL.Path != "/healthz" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
+		if !s.hostAllowed(r.Host) {
+			writeErr(w, http.StatusForbidden, "host not allowed")
+			return
+		}
+		if r.URL.Path != "/healthz" {
+			got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if s.Token == "" || !ok || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
 				writeErr(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+		}
+		if r.Method == http.MethodPost {
+			ct := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+			if ct != "application/json" {
+				writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	for _, h := range s.AllowedHosts {
+		if strings.EqualFold(h, host) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

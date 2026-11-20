@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -25,6 +26,8 @@ type Item struct {
 	TaskTitle  string   `json:"task_title,omitempty"`
 	Status     string   `json:"status"` // new | done
 	CreatedAt  string   `json:"created_at"`
+	// Batched is set once the item went out in an inbox.batch webhook.
+	Batched bool `json:"-"`
 }
 
 type Draft struct {
@@ -41,6 +44,18 @@ type Draft struct {
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
+	// The inbox holds full message texts: keep it private to the owner.
+	// SQLite gives -wal/-shm files the same mode as the database.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, err
@@ -60,6 +75,12 @@ CREATE TABLE IF NOT EXISTS drafts (
   status TEXT NOT NULL DEFAULT 'pending', sent_message_id INTEGER, note TEXT,
   created_at TEXT NOT NULL);`)
 	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	// v0.3: remember which items an agent was already notified about.
+	if _, err := db.Exec(`ALTER TABLE items ADD COLUMN batched INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
 		db.Close()
 		return nil, err
 	}
@@ -89,7 +110,7 @@ func (s *Store) Add(ctx context.Context, it *Item) (bool, error) {
 	return true, nil
 }
 
-const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at`
+const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, batched`
 
 func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var it Item
@@ -97,7 +118,7 @@ func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var chatID, taskID sql.NullInt64
 	var name, title, ttitle sql.NullString
 	err := r.Scan(&it.ID, &it.MessageID, &it.DialogID, &chatID, &it.SenderID, &name, &it.Text, &it.Date,
-		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt)
+		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt, &it.Batched)
 	it.ChatID, it.TaskID = chatID.Int64, taskID.Int64
 	it.SenderName, it.ChatTitle, it.TaskTitle = name.String, title.String, ttitle.String
 	it.Labels = []string{}
@@ -162,6 +183,20 @@ func (s *Store) ListDialog(ctx context.Context, dialogID, status string) ([]Item
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// MarkBatched records that ids were delivered in a batch.
+func (s *Store) MarkBatched(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE items SET batched=1 WHERE id IN (`+ph+`)`, args...)
+	return err
 }
 
 // Done marks items as handled. It returns how many changed.

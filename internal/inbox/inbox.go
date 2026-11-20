@@ -108,13 +108,15 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 	if p.Sender != nil {
 		it.SenderName = p.Sender.Name
 	}
-	return in.add(ctx, &it)
+	_, err = in.add(ctx, &it)
+	return err
 }
 
-func (in *Inbox) add(ctx context.Context, it *Item) error {
+// add stores it and notifies; added=false for a message already in the inbox.
+func (in *Inbox) add(ctx context.Context, it *Item) (bool, error) {
 	added, err := in.Store.Add(ctx, it)
 	if err != nil || !added {
-		return err
+		return false, err
 	}
 	in.Log.Info("inbox: new", "id", it.ID, "labels", strings.Join(it.Labels, ","), "dialog", it.DialogID)
 	if in.batch != nil {
@@ -123,7 +125,7 @@ func (in *Inbox) add(ctx context.Context, it *Item) error {
 	if in.OnNew != nil {
 		in.OnNew(*it)
 	}
-	return nil
+	return true, nil
 }
 
 // Backfill picks up what arrived while the bridge was down: unread dialogs and
@@ -190,10 +192,13 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 				SenderName: h.UserName(m.AuthorID), Text: withAttachment(PlainText(m.Text), hasFiles(m.Params)), Date: m.Date,
 				Labels: labels, ChatTitle: meta.Title, TaskID: meta.TaskID, TaskTitle: meta.TaskTitle,
 			}
-			if err := in.add(ctx, &it); err != nil {
+			added, err := in.add(ctx, &it)
+			if err != nil {
 				return err
 			}
-			n++
+			if added {
+				n++
+			}
 		}
 	}
 	in.Log.Info("inbox: backfill done", "dialogs", len(dialogs), "items", n)
@@ -219,6 +224,8 @@ func (in *Inbox) notify(ctx context.Context, text string) {
 // command handles the user's own messages in the self chat.
 func (in *Inbox) command(ctx context.Context, raw string) error {
 	text := html.UnescapeString(PlainText(raw))
+	// For "N: text" keep the user's own formatting (BB-codes) in the reply.
+	rawText := html.UnescapeString(raw)
 	if m := reOK.FindStringSubmatch(text); m != nil {
 		id, _ := strconv.ParseInt(m[2], 10, 64)
 		return in.Approve(ctx, id, "")
@@ -227,7 +234,7 @@ func (in *Inbox) command(ctx context.Context, raw string) error {
 		id, _ := strconv.ParseInt(m[2], 10, 64)
 		return in.Reject(ctx, id)
 	}
-	if m := reEdit.FindStringSubmatch(text); m != nil {
+	if m := reEdit.FindStringSubmatch(rawText); m != nil {
 		id, _ := strconv.ParseInt(m[1], 10, 64)
 		return in.Approve(ctx, id, m[2])
 	}
@@ -286,6 +293,45 @@ func (in *Inbox) Approve(ctx context.Context, id int64, newText string) error {
 	}
 	_ = in.Store.DoneDialog(ctx, d.DialogID)
 	in.notify(ctx, fmt.Sprintf("✅ #%d отправлен.", id))
+	return nil
+}
+
+// RecoverSending settles drafts left in "sending" by a crash between the
+// send and its bookkeeping: if the dialog shows my message with the draft's
+// text after the draft was created, it was sent; otherwise mark it failed
+// and tell the user, who can resend by hand. Never resends automatically.
+func (in *Inbox) RecoverSending(ctx context.Context) error {
+	drafts, err := in.Store.ListDrafts(ctx, "sending", 100)
+	if err != nil {
+		return err
+	}
+	me := in.Me()
+	for _, d := range drafts {
+		created, _ := time.Parse(time.RFC3339, d.CreatedAt)
+		var sentID int64
+		if h, err := in.Portal.DialogHistory(ctx, d.DialogID, 30); err == nil {
+			for _, m := range h.Messages {
+				t, _ := time.Parse(time.RFC3339, m.Date)
+				if m.AuthorID == me && !t.Before(created.Add(-time.Minute)) &&
+					strings.TrimSpace(html.UnescapeString(m.Text)) == strings.TrimSpace(d.Text) {
+					sentID = m.ID
+					break
+				}
+			}
+		} else {
+			in.Log.Warn("inbox: recover draft history", "draft", d.ID, "err", err)
+			continue // try again on the next start
+		}
+		if sentID > 0 {
+			_, _ = in.Store.MoveDraft(ctx, d.ID, "sending", "sent", "", "recovered after restart", sentID)
+			if d.InboxID > 0 {
+				_, _ = in.Store.Done(ctx, []int64{d.InboxID})
+			}
+			continue
+		}
+		_, _ = in.Store.MoveDraft(ctx, d.ID, "sending", "failed", "", "interrupted, not found in the dialog", 0)
+		in.notify(ctx, fmt.Sprintf("⚠️ #%d: отправка прервалась, в диалоге сообщения нет. Отправьте вручную, если нужно.", d.ID))
+	}
 	return nil
 }
 

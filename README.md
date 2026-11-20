@@ -27,7 +27,7 @@ go build -o bin/b24bridge ./cmd/b24bridge
 ```
 
 ```bash
-B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=https://my.app/hook WEBHOOK_SECRET=change-me ./bin/b24bridge
+B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookies.txt API_TOKEN=$(openssl rand -hex 24) WEBHOOK_URLS=https://my.app/hook WEBHOOK_SECRET=$(openssl rand -hex 24) ./bin/b24bridge
 ```
 
 При старте сервис открывает `/online/`, берёт оттуда `sessid` и ваш `USER_ID`.
@@ -45,7 +45,7 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 - **Полный выход** («выйти на всех устройствах», смена пароля, истёк срок
   «Запомнить меня»): вебхук `session.logged_out`, `/healthz` → `session.authorized=false`,
   push-подписка ждёт. Войдите в браузере и отправьте новый Cookie:
-  `curl -X POST localhost:3077/session/cookies --data-binary @cookies.txt` —
+  `curl -X POST localhost:3077/session/cookies -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' --data-binary @cookies.txt` —
   сервис продолжит без перезапуска и пришлёт `session.restored`.
 - Если cookie не годятся уже при старте — сервис завершается с ошибкой.
 
@@ -58,7 +58,7 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 | `B24_SESSID` | необязательно, иначе берётся со страницы |
 | `WEBHOOK_URLS` | через запятую |
 | `WEBHOOK_SECRET` | ключ HMAC для `X-Hub-Signature-256` |
-| `WEBHOOK_EVENTS` | фильтр, например `message,message.edited`; пусто = все |
+| `WEBHOOK_EVENTS` | пусто — только нужное агенту: `inbox.batch` (или `inbox.new` при `INBOX_BATCH_WINDOW=0`), `session.logged_out`, `session.restored`; `*` — все события мессенджера; иначе список через запятую |
 | `WEBHOOK_INCLUDE_OWN` | `true` — слать и события, вызванные самим аккаунтом (по умолчанию нет, чтобы бот не отвечал сам себе) |
 | `SESSION_KEEPALIVE` | период keepalive, по умолчанию `10m` |
 | `B24_COOKIE_READONLY` | `true` — не перезаписывать файл cookie |
@@ -73,7 +73,8 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 | `WEBHOOK_INCLUDE_SYSTEM` | `true` — слать на вебхук и служебные `message` (по умолчанию нет) |
 | `AGENT_SEND_MODE` | `direct` — дать агенту `send_message` без подтверждения |
 | `LISTEN_ADDR` | по умолчанию `127.0.0.1:3000` |
-| `API_TOKEN` | если задан, API требует `Authorization: Bearer <token>` |
+| `API_TOKEN` | **обязателен**, 16+ символов (`openssl rand -hex 24`): все запросы, кроме `/healthz`, — с `Authorization: Bearer <token>` |
+| `API_ALLOWED_HOSTS` | доп. значения заголовка `Host` кроме localhost, например адрес туннеля |
 | `LOG_LEVEL` | `debug` — логировать и пропущенные служебные команды |
 
 ## Вебхук
@@ -119,11 +120,11 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 отсечь отправителей (`INBOX_IGNORE_SENDERS`) и тексты по шаблону (`INBOX_IGNORE_TEXT`),
 например `INBOX_IGNORE_TEXT='^(спасибо|ок|\+)$'`.
 
-Для агента достаточно `WEBHOOK_EVENTS=inbox.batch,session.logged_out`: без фильтра на вебхук
-уходят все события мессенджера (кроме служебных сообщений — см. `WEBHOOK_INCLUDE_SYSTEM`). Если вы ответили в диалоге сами,
+По умолчанию на вебхук уходят только `inbox.batch` и события сессии; все события мессенджера —
+`WEBHOOK_EVENTS=*` (служебные сообщения и тогда отсекаются, см. `WEBHOOK_INCLUDE_SYSTEM`). Если вы ответили в диалоге сами,
 его элементы закрываются. При старте сервис добирает пропущенное за `INBOX_BACKFILL` (24h):
 непрочитанные диалоги и чаты ваших задач с активностью; сообщения старше вашего последнего ответа
-в том же чате считаются обработанными. Каждый новый элемент — вебхук `inbox.new`.
+в том же чате считаются обработанными. При `INBOX_BATCH_WINDOW=0` каждый новый элемент — вебхук `inbox.new`.
 
 ### Пачки сообщений
 
@@ -131,7 +132,9 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 Поэтому диалог «дозревает»: пока собеседник пишет, сервис ждёт паузу `INBOX_BATCH_WINDOW`
 (3m) и только потом шлёт один вебхук `inbox.batch` со всеми новыми сообщениями диалога.
 Если человек пишет без пауз, пачка всё равно уходит через `INBOX_BATCH_MAX` (10m) после первого
-сообщения. Если вы сами ответили в диалоге за это время — пачка не отправляется.
+сообщения. Если вы сами ответили в диалоге за это время — пачка не отправляется. Каждое сообщение приходит
+агенту в `items` только один раз; ещё не отвеченные сообщения из прошлых пачек лежат в `earlier`
+как контекст (по ним, возможно, уже ждёт черновик).
 `inbox_list` (MCP и `/inbox`) тоже не показывает диалоги, которые ещё «дозревают»
 (`include_settling=true` — показать). `INBOX_BATCH_WINDOW=0` выключает группировку.
 
@@ -139,7 +142,8 @@ B24_PORTAL=https://example.bitrix24.ru B24_COOKIE_FILE=cookie.txt WEBHOOK_URLS=h
 {"event": "inbox.batch", "payload": {
   "dialog_id": "88", "labels": ["direct"],
   "text": "Директор: привет\nесть минута?\nпо отчёту вопрос",
-  "items": [{"id": 12, "message_id": 338401, "...": "..."}, "..."]
+  "items": [{"id": 12, "message_id": 338401, "...": "..."}, "..."],
+  "earlier": ["…ещё без ответа, уже были в прошлой пачке…"]
 }}
 ```
 
@@ -214,3 +218,13 @@ internal/api         HTTP API
 - Несколько аккаунтов.
 - Ответы на ваши сообщения (reply) как ещё один повод попасть в inbox.
 - Поддержка push-сервера v5 (JSON-RPC), если портал на него переедет.
+
+## Безопасность
+
+- API слушает `127.0.0.1` и требует `API_TOKEN`; без него сервис не запустится.
+- Все `POST` — только с `Content-Type: application/json`, заголовок `Host` — только localhost
+  или `API_ALLOWED_HOSTS`. Это закрывает запросы со сторонних сайтов в вашем браузере
+  (CSRF на localhost и DNS rebinding).
+- `cookies.txt` и `inbox.db` создаются с правами `600`: в базе — полные тексты переписок.
+- Черновик, отправка которого прервалась падением, при старте сверяется с диалогом и помечается
+  `sent` или `failed` (с уведомлением в чат с собой); повторно сам не отправляется.

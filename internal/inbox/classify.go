@@ -89,6 +89,9 @@ func (r *Resolver) Meta(ctx context.Context, dialogID string) (ChatMeta, error) 
 	return m, nil
 }
 
+// maxCache bounds the dialog cache; expired entries are dropped when full.
+const maxCache = 2000
+
 // Put seeds the cache (e.g. from tasks.task.list during backfill).
 func (r *Resolver) Put(dialogID string, m ChatMeta) {
 	r.mu.Lock()
@@ -96,7 +99,27 @@ func (r *Resolver) Put(dialogID string, m ChatMeta) {
 	if r.cache == nil {
 		r.cache = map[string]cached{}
 	}
+	if len(r.cache) >= maxCache {
+		ttl := r.TTL
+		if ttl == 0 {
+			ttl = 10 * time.Minute
+		}
+		for k, c := range r.cache {
+			if time.Since(c.at) >= ttl {
+				delete(r.cache, k)
+			}
+		}
+		if len(r.cache) >= maxCache { // all fresh: start over rather than grow
+			r.cache = map[string]cached{}
+		}
+	}
 	r.cache[dialogID] = cached{meta: m, at: time.Now()}
+}
+
+func (r *Resolver) size() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.cache)
 }
 
 var reMention = regexp.MustCompile(`(?i)\[user=(\d+)\]`)
@@ -136,8 +159,13 @@ func Labels(dialogID string, senderID int64, text string, system bool, meta Chat
 }
 
 // PlainText strips the BB-codes agents do not need ([USER=1]Name[/USER] → @Name).
+var (
+	reUserTag = regexp.MustCompile(`(?i)\[user=\d+\](.*?)\[/user\]`)
+	reFormat  = regexp.MustCompile(`(?i)\[/?(b|i|u|s|url(=[^\]]*)?|quote|code|br)\]`)
+)
+
 func PlainText(s string) string {
-	s = regexp.MustCompile(`(?i)\[user=\d+\](.*?)\[/user\]`).ReplaceAllString(s, "@$1")
-	s = regexp.MustCompile(`(?i)\[/?(b|i|u|s|url(=[^\]]*)?|quote|code|br)\]`).ReplaceAllString(s, "")
+	s = reUserTag.ReplaceAllString(s, "@$1")
+	s = reFormat.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
 }

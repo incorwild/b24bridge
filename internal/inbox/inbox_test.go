@@ -3,6 +3,7 @@ package inbox
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -346,5 +347,73 @@ func TestBackfillSkipsBots(t *testing.T) {
 	_ = in.Backfill(context.Background(), time.Now().Add(-time.Hour))
 	if got := labelsOf(t, in); len(got) != 0 {
 		t.Fatalf("bot message in inbox: %v", got)
+	}
+}
+
+func TestInboxDBIsPrivate(t *testing.T) {
+	path := t.TempDir() + "/inbox.db"
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+}
+
+func TestRecoverSending(t *testing.T) {
+	in, fp := newTest(t)
+	ctx := context.Background()
+	d1, _ := in.ProposeReply(ctx, "88", "Готово, проверь", 0)
+	d2, _ := in.ProposeReply(ctx, "99", "Не дошло", 0)
+	for _, id := range []int64{d1.ID, d2.ID} {
+		if ok, _ := in.Store.MoveDraft(ctx, id, "pending", "sending", "", "", 0); !ok {
+			t.Fatal("setup")
+		}
+	}
+	// The crash happened after Bitrix accepted d1 but before bookkeeping.
+	fp.hist["88"] = bitrix.History{Messages: []bitrix.HistoryMessage{
+		{ID: 777, AuthorID: me, Date: time.Now().Format(time.RFC3339), Text: "Готово, проверь"},
+	}}
+	before := len(fp.sentTo("54"))
+	if err := in.RecoverSending(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := in.Store.GetDraft(ctx, d1.ID); g.Status != "sent" || g.SentMessageID != 777 {
+		t.Fatalf("d1 %+v", g)
+	}
+	if g, _ := in.Store.GetDraft(ctx, d2.ID); g.Status != "failed" {
+		t.Fatalf("d2 %+v", g)
+	}
+	if len(fp.sentTo("88"))+len(fp.sentTo("99")) != 0 {
+		t.Fatal("recovery must never resend")
+	}
+	if len(fp.sentTo("54")) != before+1 {
+		t.Fatal("user should be told about the failed draft")
+	}
+}
+
+func TestEditKeepsFormatting(t *testing.T) {
+	in, fp := newTest(t)
+	ctx := context.Background()
+	d, _ := in.ProposeReply(ctx, "88", "черновик", 0)
+	_ = in.Handle(ctx, msg(1, "54", me, fmt.Sprintf("%d: [b]важно[/b] &amp; срочно", d.ID)))
+	if got := fp.sentTo("88"); len(got) != 1 || got[0] != "[b]важно[/b] & срочно" {
+		t.Fatalf("sent %q", got)
+	}
+}
+
+func TestResolverCacheBounded(t *testing.T) {
+	r := &Resolver{}
+	for i := 0; i < maxCache+10; i++ {
+		r.Put(fmt.Sprintf("chat%d", i), ChatMeta{})
+	}
+	if n := r.size(); n > maxCache {
+		t.Fatalf("cache grew to %d", n)
 	}
 }

@@ -134,3 +134,29 @@ func TestInboxBatchCancelledByOwnReply(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// A second burst while the first is still unanswered (draft pending) must not
+// re-send the first burst as new.
+func TestSecondBatchCarriesOnlyNewItems(t *testing.T) {
+	in, _ := newTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan Batch, 4)
+	in.EnableBatching(ctx, 50*time.Millisecond, time.Second, func(b Batch) { got <- b })
+
+	_ = in.Handle(ctx, msg(1, "88", 88, "привет"))
+	_ = in.Handle(ctx, msg(2, "88", 88, "вопрос 1"))
+	b1 := <-got
+	if len(b1.Items) != 2 || len(b1.Earlier) != 0 {
+		t.Fatalf("batch 1: %d items, %d earlier", len(b1.Items), len(b1.Earlier))
+	}
+	_ = in.Handle(ctx, msg(3, "88", 88, "и ещё вопрос 2"))
+	select {
+	case b2 := <-got:
+		if len(b2.Items) != 1 || b2.Items[0].MessageID != 3 || len(b2.Earlier) != 2 || b2.Text != "User88: и ещё вопрос 2" {
+			t.Fatalf("batch 2: %+v", b2)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no second batch")
+	}
+}

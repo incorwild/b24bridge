@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +40,11 @@ func main() {
 		fatal("config", errors.New("set B24_PORTAL and B24_COOKIE (or B24_COOKIE_FILE)"))
 	}
 
+	token := os.Getenv("API_TOKEN")
+	if len(token) < 16 {
+		fatal("config", errors.New("set API_TOKEN to a random string of 16+ characters (e.g. `openssl rand -hex 24`): the API can write to Bitrix24 as you"))
+	}
+
 	b24, err := bitrix.New(bitrix.Options{Portal: portal, Cookie: cookie, SessID: os.Getenv("B24_SESSID")})
 	if err != nil {
 		fatal("client", err)
@@ -50,9 +56,13 @@ func main() {
 	wh := &webhook.Sender{
 		URLs:       splitList(os.Getenv("WEBHOOK_URLS")),
 		Secret:     os.Getenv("WEBHOOK_SECRET"),
-		Events:     toSet(splitList(os.Getenv("WEBHOOK_EVENTS"))),
+		Events:     webhookEvents(os.Getenv("WEBHOOK_EVENTS"), os.Getenv("INBOX_BATCH_WINDOW")),
 		SkipFromMe: os.Getenv("WEBHOOK_INCLUDE_OWN") != "true",
 	}
+	if len(wh.URLs) > 0 && wh.Secret == "" {
+		log.Warn("WEBHOOK_SECRET is empty: receivers cannot verify X-Hub-Signature-256, anyone can forge webhooks")
+	}
+	log.Info("webhooks", "urls", len(wh.URLs), "events", eventNames(wh.Events))
 	wh.Start(ctx, 4)
 
 	// Session lifecycle, like device.logged_out in go-whatsapp-web-multidevice.
@@ -113,13 +123,8 @@ func main() {
 	if err != nil {
 		fatal("inbox filter", err)
 	}
-	in.OnNew = func(it inbox.Item) {
-		wh.Enqueue("inbox.new", false, map[string]any{
-			"event": "inbox.new", "timestamp": time.Now().UTC(), "portal": b24.Host(),
-			"user_id": b24.UserID(), "payload": it,
-		})
-	}
-	// Bursts of messages in one dialog are reported once the sender pauses.
+	// Bursts of messages in one dialog are reported once the sender pauses
+	// (inbox.batch); with INBOX_BATCH_WINDOW=0 every item goes out as inbox.new.
 	batchWindow, batchMax := 3*time.Minute, 10*time.Minute
 	if d, err := time.ParseDuration(os.Getenv("INBOX_BATCH_WINDOW")); err == nil {
 		batchWindow = d
@@ -127,7 +132,14 @@ func main() {
 	if d, err := time.ParseDuration(os.Getenv("INBOX_BATCH_MAX")); err == nil && d > 0 {
 		batchMax = d
 	}
-	if batchWindow > 0 {
+	if batchWindow <= 0 {
+		in.OnNew = func(it inbox.Item) {
+			wh.Enqueue("inbox.new", false, map[string]any{
+				"event": "inbox.new", "timestamp": time.Now().UTC(), "portal": b24.Host(),
+				"user_id": b24.UserID(), "payload": it,
+			})
+		}
+	} else {
 		in.EnableBatching(ctx, batchWindow, batchMax, func(b inbox.Batch) {
 			wh.Enqueue("inbox.batch", false, map[string]any{
 				"event": "inbox.batch", "timestamp": time.Now().UTC(), "portal": b24.Host(),
@@ -136,6 +148,9 @@ func main() {
 		})
 	}
 	go in.Run(ctx)
+	if err := in.RecoverSending(ctx); err != nil {
+		log.Warn("inbox: recover drafts", "err", err)
+	}
 	backfill := 24 * time.Hour
 	if d, err := time.ParseDuration(os.Getenv("INBOX_BACKFILL")); err == nil {
 		backfill = d
@@ -170,8 +185,9 @@ func main() {
 		addr = "127.0.0.1:3000"
 	}
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           (&api.Server{B24: b24, Listener: listener, Token: os.Getenv("API_TOKEN"), Inbox: in, MCP: mcpHandler}).Handler(),
+		Addr: addr,
+		Handler: (&api.Server{B24: b24, Listener: listener, Token: token, Inbox: in, MCP: mcpHandler,
+			AllowedHosts: splitList(os.Getenv("API_ALLOWED_HOSTS"))}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -196,6 +212,34 @@ func level() slog.Level {
 		return slog.LevelDebug
 	}
 	return slog.LevelInfo
+}
+
+// webhookEvents: empty = what an agent needs (inbox batches or items, and
+// session changes); "*" = every messenger event; otherwise the given list.
+func webhookEvents(env, batchWindow string) map[string]bool {
+	switch strings.TrimSpace(env) {
+	case "*":
+		return nil
+	case "":
+		inboxEvent := "inbox.batch"
+		if d, err := time.ParseDuration(batchWindow); err == nil && d <= 0 {
+			inboxEvent = "inbox.new"
+		}
+		return map[string]bool{inboxEvent: true, "session.logged_out": true, "session.restored": true}
+	}
+	return toSet(splitList(env))
+}
+
+func eventNames(m map[string]bool) string {
+	if len(m) == 0 {
+		return "*"
+	}
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }
 
 func splitList(s string) []string {
