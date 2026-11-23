@@ -37,6 +37,7 @@
 
 Входящее = `message.senderId != <свой userId>`. Свои исходящие тоже приходят — фильтровать (иначе автоответчик ответит сам себе).
 «Собеседник прочитал» (поймано позже, через сервис): `params = {dialogId, chatId, userId, userName, lastId, date, viewedMessages[], chatMessageStatus:"delivered"}`.
+Ответ на сообщение: `message.params.REPLY_ID` (строка), исходное сообщение — в `message.additionalEntities.messages[]` (`id`, автор, `text`). У обычных сообщений `params = []`. `im.dialog.messages.get` поле `REPLY_ID` не отдаёт, `im.v2.Chat.Message.list` (`dialogId`, `limit`) отдаёт.
 «Печатает»: `params = {dialogId, userId, userName, userFirstName}`.
 Своё прочтение (`readMessageChat`): `{dialogId, chatId, lastId, counter, viewedMessages[], unread, muted}`.
 

@@ -515,3 +515,13 @@ func TestNormalizeReply(t *testing.T) {
 		t.Fatal("not a reply")
 	}
 }
+
+// Shape of a live reply push (2026-11-23): the target is in
+// additionalEntities.messages, additionalMessages is empty.
+func TestNormalizeLiveReplyShape(t *testing.T) {
+	fr := strings.Replace(frameMessage, `"params":[]`, `"params":{"REPLY_ID":"340170"},"additionalEntities":{"users":[],"files":[],"additionalMessages":[],"messages":[{"id":340170,"chat_id":12250,"author_id":54,"text":"q","params":[]}]}`, 1)
+	ev, _ := Normalize(ParseFrame([]byte(fr))[0], 54)
+	if r := ev.Payload.ReplyTo; r == nil || r.ID != 340170 || r.AuthorID != 54 || r.Text != "q" {
+		t.Fatalf("reply %+v", r)
+	}
+}
