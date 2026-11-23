@@ -20,6 +20,8 @@ type Portal interface {
 	DialogHistory(ctx context.Context, dialogID string, limit int) (bitrix.History, error)
 	MyActiveTasks(ctx context.Context, userID int64, since time.Time) ([]bitrix.Task, error)
 	UnreadDialogs(ctx context.Context) ([]bitrix.RecentItem, error)
+	MessageByID(ctx context.Context, dialogID string, id int64) (bitrix.HistoryMessage, bool, error)
+	ReplyRefs(ctx context.Context, dialogID string, limit int) (map[int64]bitrix.ReplyRef, error)
 }
 
 type Inbox struct {
@@ -96,7 +98,8 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 		in.Log.Debug("inbox: filtered", "reason", reason, "message_id", p.MessageID)
 		return nil
 	}
-	labels := Labels(p.DialogID, p.SenderID, p.Text, p.System, meta, me, in.Filter.IncludeSystem)
+	reply, replyToMe := in.resolveReply(ctx, p.DialogID, p.ReplyTo)
+	labels := Labels(p.DialogID, p.SenderID, p.Text, p.System, replyToMe, meta, me, in.Filter.IncludeSystem)
 	if len(labels) == 0 {
 		return nil
 	}
@@ -108,8 +111,30 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 	if p.Sender != nil {
 		it.SenderName = p.Sender.Name
 	}
+	it.setReply(reply)
 	_, err = in.add(ctx, &it)
 	return err
+}
+
+// resolveReply completes a reply reference and reports whether it answers the
+// user. If the target cannot be loaded, the reply counts as addressed to the
+// user: an extra notification is better than a missed answer.
+func (in *Inbox) resolveReply(ctx context.Context, dialogID string, ref *bitrix.ReplyRef) (*bitrix.ReplyRef, bool) {
+	if ref == nil || ref.ID == 0 {
+		return nil, false
+	}
+	r := *ref
+	if r.AuthorID == 0 {
+		m, ok, err := in.Portal.MessageByID(ctx, dialogID, r.ID)
+		if err != nil {
+			in.Log.Warn("inbox: reply target", "dialog", dialogID, "message_id", r.ID, "err", err)
+			return &r, true
+		}
+		if ok {
+			r.AuthorID, r.Text = m.AuthorID, m.Text
+		}
+	}
+	return &r, r.AuthorID == in.Me()
 }
 
 // add stores it and notifies; added=false for a message already in the inbox.
@@ -173,6 +198,10 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 				lastMine = m.ID
 			}
 		}
+		refs, err := in.Portal.ReplyRefs(ctx, d, 50)
+		if err != nil {
+			in.Log.Warn("inbox: replies", "dialog", d, "err", err)
+		}
 		for _, m := range h.Messages {
 			if m.ID <= lastMine {
 				continue
@@ -183,7 +212,12 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 			if in.Filter.Skip(m.AuthorID, h.IsBot(m.AuthorID), m.Text) != "" {
 				continue
 			}
-			labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, meta, me, in.Filter.IncludeSystem)
+			var ref *bitrix.ReplyRef
+			if r, ok := refs[m.ID]; ok {
+				ref = &r
+			}
+			reply, replyToMe := in.resolveReply(ctx, d, ref)
+			labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, replyToMe, meta, me, in.Filter.IncludeSystem)
 			if len(labels) == 0 {
 				continue
 			}
@@ -192,6 +226,7 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 				SenderName: h.UserName(m.AuthorID), Text: withAttachment(PlainText(m.Text), hasFiles(m.Params)), Date: m.Date,
 				Labels: labels, ChatTitle: meta.Title, TaskID: meta.TaskID, TaskTitle: meta.TaskTitle,
 			}
+			it.setReply(reply)
 			added, err := in.add(ctx, &it)
 			if err != nil {
 				return err

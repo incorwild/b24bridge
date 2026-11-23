@@ -19,6 +19,7 @@ import (
 const (
 	LabelDirect          = "direct"
 	LabelMention         = "mention"
+	LabelReply           = "reply" // a reply to my message
 	LabelTaskResponsible = "task_responsible"
 	LabelTaskAccomplice  = "task_accomplice"
 )
@@ -137,7 +138,7 @@ func Mentions(text string, userID int64) bool {
 
 // Labels decides why a message matters. Empty means skip it. Own messages and
 // the self chat never match.
-func Labels(dialogID string, senderID int64, text string, system bool, meta ChatMeta, me int64, includeSystem bool) []string {
+func Labels(dialogID string, senderID int64, text string, system, replyToMe bool, meta ChatMeta, me int64, includeSystem bool) []string {
 	if senderID == me || dialogID == strconv.FormatInt(me, 10) {
 		return nil
 	}
@@ -147,6 +148,9 @@ func Labels(dialogID string, senderID int64, text string, system bool, meta Chat
 	}
 	if !system && Mentions(text, me) {
 		l = append(l, LabelMention)
+	}
+	if !system && replyToMe {
+		l = append(l, LabelReply)
 	}
 	if meta.TaskRole != "" && (!system || includeSystem) {
 		if meta.TaskRole == "responsible" {

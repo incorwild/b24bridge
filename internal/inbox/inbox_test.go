@@ -24,6 +24,25 @@ type fakePortal struct {
 	hist    map[string]bitrix.History
 	unread  []bitrix.RecentItem
 	failTo  string
+	refs    map[string]map[int64]bitrix.ReplyRef
+	byIDErr error
+	lookups int
+}
+
+func (f *fakePortal) ReplyRefs(_ context.Context, d string, _ int) (map[int64]bitrix.ReplyRef, error) {
+	return f.refs[d], nil
+}
+func (f *fakePortal) MessageByID(_ context.Context, d string, id int64) (bitrix.HistoryMessage, bool, error) {
+	f.lookups++
+	if f.byIDErr != nil {
+		return bitrix.HistoryMessage{}, false, f.byIDErr
+	}
+	for _, m := range f.hist[d].Messages {
+		if m.ID == id {
+			return m, true, nil
+		}
+	}
+	return bitrix.HistoryMessage{}, false, nil
 }
 
 func (f *fakePortal) DialogInfo(_ context.Context, d string) (bitrix.DialogInfo, error) {
@@ -444,5 +463,70 @@ func TestSameText(t *testing.T) {
 	}
 	if sameText("другой текст", "Ссылка") {
 		t.Fatal("different texts matched")
+	}
+}
+
+func reply(id int64, dialog string, sender, to int64) bitrix.Event {
+	ev := msg(id, dialog, sender, "да, давай")
+	ev.Payload.ReplyTo = &bitrix.ReplyRef{ID: to}
+	return ev
+}
+
+// A reply to my message in a group chat has no mention: it must still arrive.
+func TestRepliesToMe(t *testing.T) {
+	in, fp := newTest(t)
+	ctx := context.Background()
+	fp.hist["chat100"] = bitrix.History{Messages: []bitrix.HistoryMessage{
+		{ID: 10, AuthorID: me, Text: "созвон в [b]15:00[/b]?"}, {ID: 11, AuthorID: 88, Text: "чужое"},
+	}}
+	_ = in.Handle(ctx, reply(20, "chat100", 88, 10)) // to me, target looked up
+	_ = in.Handle(ctx, reply(21, "chat100", 20, 11)) // to somebody else
+	_ = in.Handle(ctx, reply(22, "chat100", 20, 99)) // target deleted
+	known := reply(23, "chat7000", 20, 5)            // target came with the push
+	known.Payload.ReplyTo.AuthorID, known.Payload.ReplyTo.Text = me, "мой текст"
+	before := fp.lookups
+	_ = in.Handle(ctx, known)
+	if fp.lookups != before {
+		t.Fatal("no lookup needed when the push carries the target")
+	}
+	bot := reply(24, "chat100", 300, 10)
+	bot.Payload.Sender.Bot = true
+	in.Filter.IgnoreBots = true
+	_ = in.Handle(ctx, bot)
+
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[20:reply 23:reply]" {
+		t.Fatalf("labels %s", got)
+	}
+	items, _ := in.Store.List(ctx, "new", 10)
+	if items[0].ReplyToID != 10 || items[0].ReplyToText != "созвон в 15:00?" {
+		t.Fatalf("reply context: %+v", items[0])
+	}
+}
+
+// When the target cannot be loaded, notify rather than lose the answer.
+func TestReplyLookupFailureStillNotifies(t *testing.T) {
+	in, fp := newTest(t)
+	fp.byIDErr = fmt.Errorf("timeout")
+	_ = in.Handle(context.Background(), reply(20, "chat100", 88, 10))
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[20:reply]" {
+		t.Fatalf("labels %s", got)
+	}
+}
+
+func TestBackfillFindsReplies(t *testing.T) {
+	in, fp := newTest(t)
+	now := time.Now().Format(time.RFC3339)
+	fp.unread = []bitrix.RecentItem{{ID: "chat100", Counter: 2}}
+	fp.hist["chat100"] = bitrix.History{Messages: []bitrix.HistoryMessage{
+		{ID: 31, AuthorID: 20, Date: now, Text: "не вам"}, {ID: 30, AuthorID: 88, Date: now, Text: "ок"}, {ID: 10, AuthorID: me, Date: now, Text: "готово?"},
+	}}
+	fp.refs = map[string]map[int64]bitrix.ReplyRef{"chat100": {
+		30: {ID: 10, AuthorID: me, Text: "готово?"}, 31: {ID: 30, AuthorID: 88},
+	}}
+	if err := in.Backfill(context.Background(), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[30:reply]" {
+		t.Fatalf("labels %s", got)
 	}
 }

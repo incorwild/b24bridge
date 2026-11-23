@@ -33,7 +33,7 @@ func Handler(d Deps) http.Handler {
 	)
 	h := &handlers{d}
 	s.AddTool(mcp.NewTool("inbox_list",
-		mcp.WithDescription("Messages that need the user's attention: direct messages, mentions of the user, and messages in chats of tasks where the user is responsible or accomplice. Oldest first."),
+		mcp.WithDescription("Messages that need the user's attention: direct messages, mentions of the user, replies to the user's messages (reply_to_text is what was answered), and messages in chats of tasks where the user is responsible or accomplice. Oldest first."),
 		mcp.WithString("status", mcp.Description("new (default), done or all"), mcp.Enum("new", "done", "all")),
 		mcp.WithNumber("limit", mcp.Description("max items, default 30")),
 		mcp.WithBoolean("include_settling", mcp.Description("also return dialogs where messages are still arriving (by default they are held back until the sender pauses)")),

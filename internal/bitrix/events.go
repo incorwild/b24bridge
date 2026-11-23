@@ -71,6 +71,8 @@ type Payload struct {
 	Status string     `json:"status,omitempty"`
 	Files  any        `json:"files,omitempty"`
 	Sender *UserBrief `json:"sender,omitempty"`
+	// ReplyTo is the message this one replies to.
+	ReplyTo *ReplyRef `json:"reply_to,omitempty"`
 }
 
 type UserBrief struct {
@@ -137,6 +139,9 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 			System   json.RawMessage `json:"system"`
 			Date     string          `json:"date"`
 			Text     string          `json:"text"`
+			Params   json.RawMessage `json:"params"`
+			// Reply targets, among others.
+			Additional json.RawMessage `json:"additionalEntities"`
 		} `json:"message"`
 		Users map[string]struct {
 			ID   ID     `json:"id"`
@@ -161,6 +166,7 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		pl.SenderID = p.Message.SenderID.Int()
 		pl.Text = p.Message.Text
 		pl.Date = p.Message.Date
+		pl.ReplyTo = pushReply(p.Message.Params, p.Message.Additional)
 		sys := string(p.Message.System)
 		pl.System = sys == `"Y"` || sys == "true" || pl.SenderID == 0
 		if pl.ChatID == 0 {

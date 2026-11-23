@@ -9,6 +9,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"b24bridge/internal/bitrix"
 )
 
 type Item struct {
@@ -24,10 +26,19 @@ type Item struct {
 	ChatTitle  string   `json:"chat_title,omitempty"`
 	TaskID     int64    `json:"task_id,omitempty"`
 	TaskTitle  string   `json:"task_title,omitempty"`
-	Status     string   `json:"status"` // new | done
-	CreatedAt  string   `json:"created_at"`
+	// ReplyToID/ReplyToText: the message this one replies to.
+	ReplyToID   int64  `json:"reply_to_id,omitempty"`
+	ReplyToText string `json:"reply_to_text,omitempty"`
+	Status      string `json:"status"` // new | done
+	CreatedAt   string `json:"created_at"`
 	// Batched is set once the item went out in an inbox.batch webhook.
 	Batched bool `json:"-"`
+}
+
+func (it *Item) setReply(r *bitrix.ReplyRef) {
+	if r != nil {
+		it.ReplyToID, it.ReplyToText = r.ID, excerpt(PlainText(r.Text), 300)
+	}
 }
 
 type Draft struct {
@@ -78,11 +89,17 @@ CREATE TABLE IF NOT EXISTS drafts (
 		db.Close()
 		return nil, err
 	}
-	// v0.3: remember which items an agent was already notified about.
-	if _, err := db.Exec(`ALTER TABLE items ADD COLUMN batched INTEGER NOT NULL DEFAULT 0`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		db.Close()
-		return nil, err
+	// Columns added after the first release.
+	for _, col := range []string{
+		`batched INTEGER NOT NULL DEFAULT 0`, // already sent in an inbox.batch
+		`reply_to_id INTEGER NOT NULL DEFAULT 0`,
+		`reply_to_text TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(`ALTER TABLE items ADD COLUMN ` + col); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, err
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -95,10 +112,10 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 func (s *Store) Add(ctx context.Context, it *Item) (bool, error) {
 	it.Status, it.CreatedAt = "new", now()
 	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO items
- (message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ (message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, reply_to_id, reply_to_text)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		it.MessageID, it.DialogID, it.ChatID, it.SenderID, it.SenderName, it.Text, it.Date,
-		strings.Join(it.Labels, ","), it.ChatTitle, it.TaskID, it.TaskTitle, it.Status, it.CreatedAt)
+		strings.Join(it.Labels, ","), it.ChatTitle, it.TaskID, it.TaskTitle, it.Status, it.CreatedAt, it.ReplyToID, it.ReplyToText)
 	if err != nil {
 		return false, err
 	}
@@ -110,7 +127,7 @@ func (s *Store) Add(ctx context.Context, it *Item) (bool, error) {
 	return true, nil
 }
 
-const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, batched`
+const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, batched, reply_to_id, reply_to_text`
 
 func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var it Item
@@ -118,7 +135,7 @@ func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var chatID, taskID sql.NullInt64
 	var name, title, ttitle sql.NullString
 	err := r.Scan(&it.ID, &it.MessageID, &it.DialogID, &chatID, &it.SenderID, &name, &it.Text, &it.Date,
-		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt, &it.Batched)
+		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt, &it.Batched, &it.ReplyToID, &it.ReplyToText)
 	it.ChatID, it.TaskID = chatID.Int64, taskID.Int64
 	it.SenderName, it.ChatTitle, it.TaskTitle = name.String, title.String, ttitle.String
 	it.Labels = []string{}

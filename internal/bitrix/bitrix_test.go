@@ -485,3 +485,33 @@ func TestKeepAliveRevivesSession(t *testing.T) {
 		t.Fatalf("state %+v cookies %s", c.Session(), c.CookieHeader())
 	}
 }
+
+func TestReplyID(t *testing.T) {
+	for raw, want := range map[string]int64{
+		`{"REPLY_ID":"328408"}`:                 328408, // im.v2.Chat.Message.list, live
+		`{"IS_EDITED":"Y","REPLY_ID":"328624"}`: 328624,
+		`{"REPLY_ID":5}`:                        5, `{"replyId":6}`: 6, `{"REPLY_ID":["7"]}`: 7,
+		`[]`: 0, `{}`: 0, `null`: 0, ``: 0, `{"REPLY_ID":"0"}`: 0,
+	} {
+		if got := replyID([]byte(raw)); got != want {
+			t.Errorf("%s: %d, want %d", raw, got, want)
+		}
+	}
+}
+
+func TestNormalizeReply(t *testing.T) {
+	fr := strings.Replace(frameMessage, `"params":[]`, `"params":{"REPLY_ID":"10"},"additionalEntities":{"messages":[],"additionalMessages":[{"id":10,"authorId":54,"text":"q"}]}`, 1)
+	ev, _ := Normalize(ParseFrame([]byte(fr))[0], 54)
+	if r := ev.Payload.ReplyTo; r == nil || r.ID != 10 || r.AuthorID != 54 || r.Text != "q" {
+		t.Fatalf("reply %+v", r)
+	}
+	// Without the target only the id is known; plain messages have no reply.
+	fr = strings.Replace(frameMessage, `"params":[]`, `"params":{"REPLY_ID":"10"},"additionalEntities":[]`, 1)
+	ev, _ = Normalize(ParseFrame([]byte(fr))[0], 54)
+	if r := ev.Payload.ReplyTo; r == nil || r.ID != 10 || r.AuthorID != 0 {
+		t.Fatalf("reply %+v", r)
+	}
+	if ev, _ = Normalize(ParseFrame([]byte(frameMessage))[0], 54); ev.Payload.ReplyTo != nil {
+		t.Fatal("not a reply")
+	}
+}
