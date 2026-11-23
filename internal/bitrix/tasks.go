@@ -170,20 +170,3 @@ func (c *Client) RecentChats(ctx context.Context, limit int) ([]RecentItem, erro
 	err := c.Call(ctx, "im.recent.list", vals("LIMIT", strconv.Itoa(limit)), &out)
 	return out.Items, err
 }
-
-// UnreadDialogs returns dialogs from the recent list with unread messages.
-func (c *Client) UnreadDialogs(ctx context.Context) ([]RecentItem, error) {
-	var out struct {
-		Items []RecentItem `json:"items"`
-	}
-	if err := c.Call(ctx, "im.recent.list", vals("LIMIT", "200"), &out); err != nil {
-		return nil, err
-	}
-	var res []RecentItem
-	for _, it := range out.Items {
-		if it.Counter > 0 {
-			res = append(res, it)
-		}
-	}
-	return res, nil
-}

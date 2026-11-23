@@ -175,6 +175,14 @@ func main() {
 			wh.Enqueue(ev.Event, ev.Payload.IsFromMe, ev)
 		},
 	}
+	if backfill > 0 {
+		// Whatever the gap was (channel refresh, network), fetch what it hid.
+		listener.OnReconnect = func(since time.Time) {
+			if err := in.Backfill(ctx, since); err != nil {
+				log.Warn("inbox catch-up", "err", err)
+			}
+		}
+	}
 	go func() { _ = listener.Run(ctx) }()
 
 	directSend := os.Getenv("AGENT_SEND_MODE") == "direct"

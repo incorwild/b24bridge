@@ -82,6 +82,7 @@ func Handler(d Deps) http.Handler {
 			mcp.WithDescription("Send a message immediately on the user's behalf, without approval."),
 			mcp.WithString("dialog_id", mcp.Required()),
 			mcp.WithString("text", mcp.Required()),
+			mcp.WithNumber("inbox_id", mcp.Description("inbox item this answers; it is closed once sent")),
 			mcp.WithDestructiveHintAnnotation(true),
 		), h.sendMessage)
 	}
@@ -91,7 +92,8 @@ func Handler(d Deps) http.Handler {
 const instructions = `You work through the user's Bitrix24 messenger.
 Start with inbox_list. People often split one thought into several messages; handle all new items of a dialog together and answer once. For each dialog, read chat_history (and task_get for task chats) before deciding; if the context is not enough, page back with before_id. To look into another chat (e.g. an earlier discussion with the same person), find it with chats_list.
 Reply with propose_reply: the user approves every reply in their own chat, so write the final text, in Russian unless the conversation is in another language, in the user's voice, without mentioning that you are an AI.
-Close items that need no answer (thanks, FYI, service notices) with inbox_done.
+In a group pass inbox_id: the reply closes only that item and its sender's earlier ones. reply_to_text is the user's message being answered; edited=true means the text changed, so replace an earlier draft rather than adding a second one.
+Close items that need no answer (thanks, FYI, service notices) or that chat_history shows the user already answered with inbox_done.
 Never invent facts, deadlines or promises; if the answer needs information you do not have, draft a short reply that asks for it or leave the item for the user.`
 
 type handlers struct{ d Deps }
@@ -361,7 +363,7 @@ func (h *handlers) sendMessage(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return errResult(err)
 	}
-	id, err := h.d.Inbox.SendNow(ctx, dialog, text)
+	id, err := h.d.Inbox.SendNow(ctx, dialog, text, int64(r.GetInt("inbox_id", 0)))
 	if err != nil {
 		return errResult(err)
 	}

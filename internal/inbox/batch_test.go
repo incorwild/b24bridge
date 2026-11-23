@@ -146,7 +146,7 @@ func TestSecondBatchCarriesOnlyNewItems(t *testing.T) {
 
 	_ = in.Handle(ctx, msg(1, "88", 88, "привет"))
 	_ = in.Handle(ctx, msg(2, "88", 88, "вопрос 1"))
-	b1 := <-got
+	b1 := nextBatch(t, got)
 	if len(b1.Items) != 2 || len(b1.Earlier) != 0 {
 		t.Fatalf("batch 1: %d items, %d earlier", len(b1.Items), len(b1.Earlier))
 	}

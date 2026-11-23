@@ -2,6 +2,7 @@ package inbox
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -27,9 +28,11 @@ type fakePortal struct {
 	refs    map[string]map[int64]bitrix.ReplyRef
 	byIDErr error
 	lookups int
+	refsFor []string // dialogs ReplyRefs was asked about
 }
 
 func (f *fakePortal) ReplyRefs(_ context.Context, d string, _ int) (map[int64]bitrix.ReplyRef, error) {
+	f.refsFor = append(f.refsFor, d)
 	return f.refs[d], nil
 }
 func (f *fakePortal) MessageByID(_ context.Context, d string, id int64) (bitrix.HistoryMessage, bool, error) {
@@ -72,7 +75,7 @@ func (f *fakePortal) MyActiveTasks(_ context.Context, uid int64, _ time.Time) ([
 	}
 	return out, nil
 }
-func (f *fakePortal) UnreadDialogs(context.Context) ([]bitrix.RecentItem, error) {
+func (f *fakePortal) RecentChats(context.Context, int) ([]bitrix.RecentItem, error) {
 	return f.unread, nil
 }
 
@@ -506,10 +509,20 @@ func TestRepliesToMe(t *testing.T) {
 // When the target cannot be loaded, notify rather than lose the answer.
 func TestReplyLookupFailureStillNotifies(t *testing.T) {
 	in, fp := newTest(t)
+	in.retryDelay = time.Millisecond
 	fp.byIDErr = fmt.Errorf("timeout")
 	_ = in.Handle(context.Background(), reply(20, "chat100", 88, 10))
-	if got := fmt.Sprint(labelsOf(t, in)); got != "map[20:reply]" {
-		t.Fatalf("labels %s", got)
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[20:reply]" || fp.lookups != 3 {
+		t.Fatalf("labels %s after %d lookups", got, fp.lookups)
+	}
+	// Throttling is temporary too.
+	fp.byIDErr = &bitrix.APIError{Status: 503, Code: "QUERY_LIMIT_EXCEEDED"}
+	_ = in.Handle(context.Background(), reply(21, "chat100", 88, 10))
+	// A refusal is final: no retries and no noise from strangers' replies.
+	fp.lookups, fp.byIDErr = 0, &bitrix.APIError{Status: 400, Code: "ACCESS_ERROR"}
+	_ = in.Handle(context.Background(), reply(22, "chat100", 88, 10))
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[20:reply 21:reply]" || fp.lookups != 1 {
+		t.Fatalf("labels %s after %d lookups", got, fp.lookups)
 	}
 }
 
@@ -528,5 +541,209 @@ func TestBackfillFindsReplies(t *testing.T) {
 	}
 	if got := fmt.Sprint(labelsOf(t, in)); got != "map[30:reply]" {
 		t.Fatalf("labels %s", got)
+	}
+}
+
+func newIDs(t *testing.T, in *Inbox) string {
+	t.Helper()
+	items, err := in.Store.List(context.Background(), "new", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []int64{}
+	for _, it := range items {
+		ids = append(ids, it.MessageID)
+	}
+	return fmt.Sprint(ids)
+}
+
+// Writing something in a group must not swallow other people's answers.
+func TestOwnGroupMessageKeepsPersonalItems(t *testing.T) {
+	in, fp := newTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan Batch, 2)
+	in.EnableBatching(ctx, 60*time.Millisecond, time.Second, func(b Batch) { got <- b })
+	fp.hist["chat100"] = bitrix.History{Messages: []bitrix.HistoryMessage{{ID: 10, AuthorID: me, Text: "q"}}}
+	_ = in.Handle(ctx, reply(20, "chat100", 88, 10))
+	_ = in.Handle(ctx, msg(21, "chat100", 20, "[USER=54]я[/USER] глянь"))
+	_ = in.Handle(ctx, msg(22, "chat100", me, "всем привет"))
+	select {
+	case b := <-got:
+		if len(b.Items) != 2 {
+			t.Fatalf("batch %+v", b)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification lost")
+	}
+	// Quoting one of them answers that one only.
+	_ = in.Handle(ctx, reply(23, "chat100", me, 20))
+	if ids := newIDs(t, in); ids != "[21]" {
+		t.Fatalf("new %s", ids)
+	}
+}
+
+// Task chat talk that is not addressed to me is still closed by my message.
+func TestOwnTaskChatMessageClosesTalk(t *testing.T) {
+	in, _ := newTest(t)
+	ctx := context.Background()
+	_ = in.Handle(ctx, msg(1, "chat5986", 20, "готово?"))
+	_ = in.Handle(ctx, msg(2, "chat5986", 88, "[USER=54]я[/USER], срок?"))
+	_ = in.Handle(ctx, msg(3, "chat5986", me, "да"))
+	if ids := newIDs(t, in); ids != "[2]" {
+		t.Fatalf("new %s", ids)
+	}
+}
+
+func TestApprovedGroupDraftClosesSendersBurst(t *testing.T) {
+	in, _ := newTest(t)
+	ctx := context.Background()
+	for id, sender := range map[int64]int64{1: 88, 2: 88, 3: 20, 4: 88} {
+		_ = in.Handle(ctx, msg(id, "chat100", sender, "[USER=54]я[/USER]"))
+	}
+	it, _, _ := in.Store.ByMessage(ctx, 2)
+	d, _ := in.ProposeReply(ctx, "chat100", "ответ", it.ID)
+	if err := in.Approve(ctx, d.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := in.Store.List(ctx, "new", 10)
+	left := map[int64]bool{}
+	for _, it := range items {
+		left[it.MessageID] = true
+	}
+	if len(left) != 2 || !left[3] || !left[4] {
+		t.Fatalf("left %v, want the other sender's 3 and the later 4", left)
+	}
+}
+
+func TestEditAndDelete(t *testing.T) {
+	in, _ := newTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan Batch, 4)
+	in.EnableBatching(ctx, 30*time.Millisecond, time.Second, func(b Batch) { got <- b })
+	go in.Run(ctx)
+	in.Enqueue(msg(1, "88", 88, "встреча в 15"))
+	if b := nextBatch(t, got); b.Text != "User88: встреча в 15" {
+		t.Fatalf("%q", b.Text)
+	}
+	e := msg(1, "88", 88, "встреча в 15")
+	e.Event = bitrix.EvMessageEdited
+	in.Enqueue(e) // only a link preview changed: nothing to report
+	e.Payload.Text = "встреча в [b]17[/b]"
+	in.Enqueue(e)
+	b := nextBatch(t, got)
+	if len(b.Items) != 1 || !b.Items[0].Edited || b.Text != "User88: (исправлено) встреча в 17" {
+		t.Fatalf("edited batch %+v", b)
+	}
+	in.Enqueue(msg(2, "88", 88, "ещё"))
+	d := bitrix.Event{Event: bitrix.EvMessageDeleted, Payload: bitrix.Payload{DialogID: "88", MessageIDs: []int64{1, 2}}}
+	in.Enqueue(d)
+	select {
+	case b := <-got:
+		t.Fatalf("deleted message delivered: %+v", b)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if ids := newIDs(t, in); ids != "[]" {
+		t.Fatalf("new %s", ids)
+	}
+	// Edits of messages that are done or unknown change nothing.
+	e.Payload.Text = "снова"
+	_ = in.Handle(ctx, e)
+	e.Payload.MessageID = 777
+	if err := in.Handle(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if ids := newIDs(t, in); ids != "[]" {
+		t.Fatalf("new %s", ids)
+	}
+}
+
+func TestBackfillGroups(t *testing.T) {
+	in, fp := newTest(t)
+	now := time.Now().Format(time.RFC3339)
+	old := time.Now().Add(-48 * time.Hour).Format(time.RFC3339)
+	recent := func(id string, counter int, date string) bitrix.RecentItem {
+		r := bitrix.RecentItem{ID: bitrix.ID(id), Counter: counter}
+		r.Message.Date = date
+		return r
+	}
+	fp.unread = []bitrix.RecentItem{
+		recent("chat100", 0, now), // already read on the phone
+		recent("chat200", 0, old), // nothing since
+		recent("chat300", 1, now), // unread, but only my own and old messages
+		recent("88", 0, now),      // read private chat: not reported again
+	}
+	fp.hist["chat100"] = bitrix.History{Messages: []bitrix.HistoryMessage{
+		{ID: 34, AuthorID: me, Date: now, Text: "другое"},
+		{ID: 33, AuthorID: 20, Date: now, Text: "болтовня"},
+		{ID: 31, AuthorID: 20, Date: now, Text: "на это я ответил цитатой"},
+		{ID: 30, AuthorID: 88, Date: now, Text: "ответ"},
+		{ID: 10, AuthorID: me, Date: now, Text: "q"},
+	}}
+	fp.refs = map[string]map[int64]bitrix.ReplyRef{"chat100": {
+		30: {ID: 10, AuthorID: me}, 31: {ID: 10, AuthorID: me}, 34: {ID: 31, AuthorID: 20},
+	}}
+	fp.hist["chat300"] = bitrix.History{Messages: []bitrix.HistoryMessage{
+		{ID: 41, AuthorID: me, Date: now, Text: "x"}, {ID: 40, AuthorID: 20, Date: old, Text: "y"}}}
+	fp.hist["88"] = bitrix.History{Messages: []bitrix.HistoryMessage{{ID: 50, AuthorID: 88, Date: now, Text: "спасибо"}}}
+	for i := 0; i < 2; i++ { // a second run adds nothing
+		if err := in.Backfill(context.Background(), time.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fmt.Sprint(labelsOf(t, in)); got != "map[30:reply]" {
+		t.Fatalf("labels %s", got)
+	}
+	for _, d := range fp.refsFor {
+		if d != "chat100" {
+			t.Fatalf("needless request for %s (%v)", d, fp.refsFor)
+		}
+	}
+}
+
+func TestBatchTextShowsWhatWasAnswered(t *testing.T) {
+	b := MakeBatch([]Item{
+		{SenderName: "Анна", Text: "да, давай", ReplyToText: "созвон в 15?"}, {SenderName: "Анна", Text: "и ещё"}})
+	if b.Text != "Анна: (в ответ на «созвон в 15?») да, давай\nи ещё" {
+		t.Fatalf("%q", b.Text)
+	}
+}
+
+func TestOldDatabaseIsUpgraded(t *testing.T) {
+	path := t.TempDir() + "/old.db"
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL UNIQUE,
+ dialog_id TEXT NOT NULL, chat_id INTEGER, sender_id INTEGER, sender_name TEXT, text TEXT, date TEXT, labels TEXT,
+ chat_title TEXT, task_id INTEGER, task_title TEXT, status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL, done_at TEXT);
+INSERT INTO items (message_id, dialog_id, sender_id, text, date, labels, created_at) VALUES (1,'88',88,'x','d','direct','c')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	for i := 0; i < 2; i++ {
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		it, ok, err := st.ByMessage(context.Background(), 1)
+		if err != nil || !ok || it.Text != "x" || it.ReplyToID != 0 || it.Edited || it.Batched {
+			t.Fatalf("%+v %v %v", it, ok, err)
+		}
+		st.Close()
+	}
+}
+
+// nextBatch fails instead of hanging when no batch comes.
+func nextBatch(t *testing.T, ch <-chan Batch) Batch {
+	t.Helper()
+	select {
+	case b := <-ch:
+		return b
+	case <-time.After(2 * time.Second):
+		t.Fatal("no batch")
+		return Batch{}
 	}
 }

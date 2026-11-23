@@ -172,6 +172,27 @@ func newFakePortal(t *testing.T) *fakePortal {
 			fmt.Fprint(w, `{"result":338284}`)
 		case "im.dialog.get":
 			fmt.Fprint(w, `{"result":{"last_message_id":338282,"readed_list":[{"user_id":88,"user_name":"C","message_id":337392},{"user_id":54,"message_id":338282}]}}`)
+		case "im.dialog.messages.get":
+			// Like the portal: newest first, older than LAST_ID, no REPLY_ID.
+			switch r.PostForm.Get("LAST_ID") {
+			case "11":
+				fmt.Fprint(w, `{"result":{"messages":[{"id":10,"author_id":54,"text":"q","params":[]}]}}`)
+			case "8": // message 7 is gone
+				fmt.Fprint(w, `{"result":{"messages":[{"id":6,"author_id":20,"text":"z","params":[]}]}}`)
+			default:
+				fmt.Fprint(w, `{"result":{"messages":[]}}`)
+			}
+		case "im.v2.Chat.Message.list":
+			if r.PostForm.Get("dialogId") != "chat100" || r.PostForm.Get("limit") != "50" {
+				fmt.Fprint(w, `{"error":"BAD","error_description":"x"}`)
+				return
+			}
+			fmt.Fprint(w, `{"result":{"messages":[
+ {"id":30,"author_id":88,"authorId":88,"text":"a","params":{"REPLY_ID":"10"}},
+ {"id":31,"author_id":20,"authorId":20,"text":"b","params":{"REPLY_ID":"30"}},
+ {"id":32,"author_id":20,"authorId":20,"text":"c","params":{"REPLY_ID":"5"}},
+ {"id":33,"author_id":20,"authorId":20,"text":"d","params":[]}],
+ "additionalMessages":[{"id":10,"authorId":54,"text":"q"}]}}`)
 		case "pull.config.get":
 			f.cfgCalls.Add(1)
 			ws := "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/subws2/"
@@ -439,7 +460,9 @@ func TestListenerReconnects(t *testing.T) {
 	_ = c.RefreshSession(ctx)
 
 	got := make(chan Event, 10)
-	l := &Listener{Client: c, Handle: func(e Event) { got <- e }}
+	gaps := make(chan time.Time, 4)
+	l := &Listener{Client: c, Handle: func(e Event) { got <- e }, OnReconnect: func(s time.Time) { gaps <- s }}
+	began := time.Now()
 	go l.Run(ctx)
 
 	var names []string
@@ -450,6 +473,15 @@ func TestListenerReconnects(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("timeout, got %v", names)
 		}
+	}
+	select {
+	case since := <-gaps:
+		// From before the drop, with a margin; reported once, not on start.
+		if since.After(began) || since.Before(began.Add(-gapMargin-time.Minute)) || len(gaps) != 0 {
+			t.Fatalf("gap since %v (began %v), %d more", since, began, len(gaps))
+		}
+	case <-ctx.Done():
+		t.Fatal("reconnect not reported")
 	}
 	if names[0] != EvMessage || names[1] != EvReaction {
 		t.Fatalf("events %v", names)
@@ -516,12 +548,64 @@ func TestNormalizeReply(t *testing.T) {
 	}
 }
 
-// Shape of a live reply push (2026-11-23): the target is in
-// additionalEntities.messages, additionalMessages is empty.
-func TestNormalizeLiveReplyShape(t *testing.T) {
+// As in a live reply push (2026-11-23), REPLY_ID is a string, the target is in
+// additionalEntities.messages and additionalMessages is empty. Key names inside
+// messages[] follow im.v2.Chat.Message.list; they were not recorded.
+func TestNormalizeReplyTargetInMessages(t *testing.T) {
 	fr := strings.Replace(frameMessage, `"params":[]`, `"params":{"REPLY_ID":"340170"},"additionalEntities":{"users":[],"files":[],"additionalMessages":[],"messages":[{"id":340170,"chat_id":12250,"author_id":54,"text":"q","params":[]}]}`, 1)
 	ev, _ := Normalize(ParseFrame([]byte(fr))[0], 54)
 	if r := ev.Payload.ReplyTo; r == nil || r.ID != 340170 || r.AuthorID != 54 || r.Text != "q" {
 		t.Fatalf("reply %+v", r)
+	}
+}
+
+func TestReplyLookups(t *testing.T) {
+	f := newFakePortal(t)
+	c := newTestClient(t, f)
+	ctx := context.Background()
+	_ = c.RefreshSession(ctx)
+	if m, ok, err := c.MessageByID(ctx, "chat100", 10); err != nil || !ok || m.AuthorID != 54 {
+		t.Fatalf("%+v %v %v", m, ok, err)
+	}
+	// The portal answers with the next older message when the target is gone.
+	if _, ok, err := c.MessageByID(ctx, "chat100", 7); err != nil || ok {
+		t.Fatalf("deleted message: %v %v", ok, err)
+	}
+	if _, ok, _ := c.MessageByID(ctx, "chat100", 1); ok {
+		t.Fatal("empty history")
+	}
+	refs, err := c.ReplyRefs(ctx, "chat100", 50)
+	want := map[int64]ReplyRef{30: {10, 54, "q"}, 31: {30, 88, "a"}, 32: {ID: 5}}
+	if err != nil || fmt.Sprint(refs) != fmt.Sprint(want) {
+		t.Fatalf("refs %v, want %v (%v)", refs, want, err)
+	}
+	if _, err := c.ReplyRefs(ctx, "chat1", 50); err == nil {
+		t.Fatal("API error must be returned")
+	}
+}
+
+func TestNormalizeDeletes(t *testing.T) {
+	frame := func(cmd, params string) PullMessage {
+		return ParseFrame([]byte(`#!NGINXNMS!#{"mid":"d","text":{"module_id":"im","command":"` + cmd + `","params":` + params + `}}#!NGINXNME!#`))[0]
+	}
+	for _, c := range []struct{ cmd, params, want string }{
+		{"messageDelete", `{"id":5,"dialogId":"88","senderId":88}`, "[5]"},
+		{"messageDeleteComplete", `{"id":"6","dialogId":"88"}`, "[6]"},
+		{"messageDeleteV2", `{"dialogId":"88","messages":[{"id":7,"completelyDeleted":true},{"id":8}]}`, "[7 8]"},
+	} {
+		ev, ok := Normalize(frame(c.cmd, c.params), 54)
+		if !ok || ev.Event != EvMessageDeleted || fmt.Sprint(ev.Payload.MessageIDs) != c.want || ev.Payload.MessageID == 0 {
+			t.Errorf("%s: %v %+v", c.cmd, ok, ev.Payload)
+		}
+	}
+}
+
+func TestRefreshIn(t *testing.T) {
+	now := time.Now()
+	if d := refreshIn(now.Add(time.Hour), now); d != time.Hour+2*time.Second {
+		t.Fatal(d) // just after expiry, never before it
+	}
+	if d := refreshIn(now.Add(-time.Hour), now); d != time.Minute {
+		t.Fatal(d)
 	}
 }

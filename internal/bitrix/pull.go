@@ -103,12 +103,16 @@ func (cfg PullConfig) ConnectionURL(s session) (string, error) {
 type Listener struct {
 	Client *Client
 	Handle func(Event)
-	Log    *slog.Logger
+	// OnReconnect is called in its own goroutine after every connection but
+	// the first, with the time since which messages may have been missed.
+	OnReconnect func(since time.Time)
+	Log         *slog.Logger
 
 	connected atomic.Bool
 	lastEvent atomic.Int64
 
 	mu   sync.Mutex
+	down time.Time // when the previous connection was last known good
 	sess session
 	seen map[string]struct{}
 	ring []string
@@ -145,7 +149,11 @@ func (l *Listener) Run(ctx context.Context) error {
 			backoff = time.Second
 			continue
 		} else {
-			l.Log.Warn("pull: disconnected", "err", err)
+			if errors.Is(err, errRefresh) {
+				l.Log.Info("pull: channel expired, refreshing")
+			} else {
+				l.Log.Warn("pull: disconnected", "err", err)
+			}
 			if time.Since(start) > time.Minute {
 				backoff = time.Second
 			}
@@ -161,6 +169,22 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 	return ctx.Err()
 }
+
+var errRefresh = errors.New("channel refresh")
+
+// refreshIn is how long a connection may live. Before the channel expires the
+// portal keeps returning the same one, so reconnecting early is useless (seen
+// live): go just after it.
+func refreshIn(exp, now time.Time) time.Duration {
+	if d := exp.Sub(now) + 2*time.Second; d > 0 {
+		return d
+	}
+	return time.Minute // stale config: do not spin
+}
+
+// gapMargin covers the time a dead connection can go unnoticed (ping period
+// plus its timeout).
+const gapMargin = 2 * time.Minute
 
 func (l *Listener) runOnce(ctx context.Context) error {
 	cfg, err := l.Client.PullConfig(ctx)
@@ -178,12 +202,7 @@ func (l *Listener) runOnce(ctx context.Context) error {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if exp := cfg.expires(); !exp.IsZero() {
-		// Reconnect a minute before the channel signature expires.
-		d := time.Until(exp) - time.Minute
-		if d < time.Minute {
-			d = time.Minute
-		}
-		t := time.AfterFunc(d, cancel)
+		t := time.AfterFunc(refreshIn(exp, time.Now()), cancel)
 		defer t.Stop()
 	}
 
@@ -197,6 +216,18 @@ func (l *Listener) runOnce(ctx context.Context) error {
 	defer conn.CloseNow()
 	conn.SetReadLimit(16 << 20)
 	l.connected.Store(true)
+	l.mu.Lock()
+	down := l.down
+	l.down = time.Time{}
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		l.down = time.Now()
+		l.mu.Unlock()
+	}()
+	if !down.IsZero() && l.OnReconnect != nil {
+		go l.OnReconnect(down.Add(-gapMargin))
+	}
 	l.Log.Info("pull: connected", "server_version", cfg.Server.Version, "expires", cfg.expires())
 
 	go func() {
@@ -222,7 +253,7 @@ func (l *Listener) runOnce(ctx context.Context) error {
 		_, data, err := conn.Read(connCtx)
 		if err != nil {
 			if connCtx.Err() != nil && ctx.Err() == nil {
-				return errors.New("channel refresh")
+				return errRefresh
 			}
 			return err
 		}

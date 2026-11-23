@@ -2,12 +2,15 @@ package inbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"b24bridge/internal/bitrix"
@@ -19,7 +22,7 @@ type Portal interface {
 	SendMessage(ctx context.Context, dialogID, text string) (int64, error)
 	DialogHistory(ctx context.Context, dialogID string, limit int) (bitrix.History, error)
 	MyActiveTasks(ctx context.Context, userID int64, since time.Time) ([]bitrix.Task, error)
-	UnreadDialogs(ctx context.Context) ([]bitrix.RecentItem, error)
+	RecentChats(ctx context.Context, limit int) ([]bitrix.RecentItem, error)
 	MessageByID(ctx context.Context, dialogID string, id int64) (bitrix.HistoryMessage, bool, error)
 	ReplyRefs(ctx context.Context, dialogID string, limit int) (map[int64]bitrix.ReplyRef, error)
 }
@@ -35,6 +38,9 @@ type Inbox struct {
 
 	queue chan bitrix.Event
 	batch *Batcher
+
+	fillMu     sync.Mutex    // one backfill at a time
+	retryDelay time.Duration // first pause between reply lookups
 }
 
 func New(store *Store, portal Portal, me func() int64) *Inbox {
@@ -45,12 +51,16 @@ func New(store *Store, portal Portal, me func() int64) *Inbox {
 		Me:       me,
 		Log:      slog.Default(),
 		queue:    make(chan bitrix.Event, 1000),
+
+		retryDelay: time.Second,
 	}
 }
 
 // Enqueue never blocks the push listener; classification needs REST calls.
 func (in *Inbox) Enqueue(ev bitrix.Event) {
-	if ev.Event != bitrix.EvMessage {
+	switch ev.Event {
+	case bitrix.EvMessage, bitrix.EvMessageEdited, bitrix.EvMessageDeleted:
+	default:
 		return
 	}
 	select {
@@ -73,20 +83,36 @@ func (in *Inbox) Run(ctx context.Context) {
 	}
 }
 
-// Handle processes one "message" event.
+// Handle processes one message event: new, edited or deleted.
 func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 	p := ev.Payload
+	switch ev.Event {
+	case bitrix.EvMessageEdited:
+		return in.edited(ctx, p)
+	case bitrix.EvMessageDeleted:
+		return in.Store.DoneMessages(ctx, p.MessageIDs...)
+	}
 	me := in.Me()
 	self := strconv.FormatInt(me, 10)
 	if p.SenderID == me {
 		if p.DialogID == self {
 			return in.command(ctx, p.Text)
 		}
-		// The user answered by hand: whatever waited in that dialog is handled.
-		if in.batch != nil {
-			in.batch.Cancel(p.DialogID)
+		// The user answered by hand.
+		if IsPrivateDialog(p.DialogID) {
+			if in.batch != nil {
+				in.batch.Cancel(p.DialogID)
+			}
+			return in.Store.DoneDialog(ctx, p.DialogID)
 		}
-		return in.Store.DoneDialog(ctx, p.DialogID)
+		// In a group only the quoted message is certainly answered; the batch
+		// keeps running and skips whatever got closed.
+		if p.ReplyTo != nil {
+			if err := in.Store.DoneMessages(ctx, p.ReplyTo.ID); err != nil {
+				return err
+			}
+		}
+		return in.Store.DoneConversation(ctx, p.DialogID)
 	}
 	meta, err := in.Resolver.Meta(ctx, p.DialogID)
 	if err != nil {
@@ -116,19 +142,66 @@ func (in *Inbox) Handle(ctx context.Context, ev bitrix.Event) error {
 	return err
 }
 
+// edited updates the text of a waiting item and hands it to the agent again.
+// Bitrix24 also sends messageUpdate when only a link preview was added.
+func (in *Inbox) edited(ctx context.Context, p bitrix.Payload) error {
+	it, ok, err := in.Store.ByMessage(ctx, p.MessageID)
+	if err != nil || !ok || it.Status != "new" {
+		return err
+	}
+	text := withAttachment(PlainText(p.Text), strings.HasSuffix(it.Text, "вложение]"))
+	if text == "" || text == it.Text {
+		return nil
+	}
+	if err := in.Store.Edit(ctx, it.ID, text); err != nil {
+		return err
+	}
+	it.Text, it.Edited = text, true
+	in.notifyNew(it)
+	return nil
+}
+
+// lookup loads a message, retrying temporary failures.
+func (in *Inbox) lookup(ctx context.Context, dialogID string, id int64) (m bitrix.HistoryMessage, ok bool, err error) {
+	wait := in.retryDelay
+	for try := 0; ; try++ {
+		m, ok, err = in.Portal.MessageByID(ctx, dialogID, id)
+		if err == nil || !transient(err) || try == 2 {
+			return m, ok, err
+		}
+		select {
+		case <-ctx.Done():
+			return m, ok, ctx.Err()
+		case <-time.After(wait):
+		}
+		wait *= 3
+	}
+}
+
+// transient tells a temporary failure from a refusal (no access, no such chat).
+func transient(err error) bool {
+	var ae *bitrix.APIError
+	if errors.As(err, &ae) {
+		return ae.Status >= 500 || strings.Contains(ae.Code, "LIMIT") || strings.Contains(ae.Code, "INTERNAL")
+	}
+	return true
+}
+
 // resolveReply completes a reply reference and reports whether it answers the
-// user. If the target cannot be loaded, the reply counts as addressed to the
-// user: an extra notification is better than a missed answer.
+// user. If the target cannot be loaded for a temporary reason even after
+// retries, the reply counts as addressed to the user: an extra notification
+// is better than a missed answer.
 func (in *Inbox) resolveReply(ctx context.Context, dialogID string, ref *bitrix.ReplyRef) (*bitrix.ReplyRef, bool) {
 	if ref == nil || ref.ID == 0 {
 		return nil, false
 	}
 	r := *ref
 	if r.AuthorID == 0 {
-		m, ok, err := in.Portal.MessageByID(ctx, dialogID, r.ID)
+		m, ok, err := in.lookup(ctx, dialogID, r.ID)
 		if err != nil {
-			in.Log.Warn("inbox: reply target", "dialog", dialogID, "message_id", r.ID, "err", err)
-			return &r, true
+			addressed := transient(err)
+			in.Log.Warn("inbox: reply target", "dialog", dialogID, "message_id", r.ID, "notify", addressed, "err", err)
+			return &r, addressed
 		}
 		if ok {
 			r.AuthorID, r.Text = m.AuthorID, m.Text
@@ -144,27 +217,39 @@ func (in *Inbox) add(ctx context.Context, it *Item) (bool, error) {
 		return false, err
 	}
 	in.Log.Info("inbox: new", "id", it.ID, "labels", strings.Join(it.Labels, ","), "dialog", it.DialogID)
+	in.notifyNew(*it)
+	return true, nil
+}
+
+func (in *Inbox) notifyNew(it Item) {
 	if in.batch != nil {
 		in.batch.Add(it.DialogID)
 	}
 	if in.OnNew != nil {
-		in.OnNew(*it)
+		in.OnNew(it)
 	}
-	return true, nil
 }
 
-// Backfill picks up what arrived while the bridge was down: unread dialogs and
-// chats of my tasks with activity since. Messages older than my latest reply
-// in the same chat count as handled.
+// Backfill picks up what arrived while the bridge was not listening: unread
+// dialogs, chats of my tasks with activity since, and - for messages addressed
+// to the user personally - chats with messages since that were already read.
 func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
+	in.fillMu.Lock()
+	defer in.fillMu.Unlock()
 	me := in.Me()
-	dialogs := map[string]bool{}
-	unread, err := in.Portal.UnreadDialogs(ctx)
+	dialogs := map[string]bool{} // dialog → personal messages only
+	recent, err := in.Portal.RecentChats(ctx, 200)
 	if err != nil {
 		return fmt.Errorf("recent list: %w", err)
 	}
-	for _, r := range unread {
-		dialogs[string(r.ID)] = true
+	for _, r := range recent {
+		t, err := time.Parse(time.RFC3339, r.Message.Date)
+		switch {
+		case r.Counter > 0:
+			dialogs[string(r.ID)] = false
+		case err == nil && !t.Before(since) && !IsPrivateDialog(string(r.ID)):
+			dialogs[string(r.ID)] = true
+		}
 	}
 	tasks, err := in.Portal.MyActiveTasks(ctx, me, since)
 	if err != nil {
@@ -176,68 +261,105 @@ func (in *Inbox) Backfill(ctx context.Context, since time.Time) error {
 		}
 		d := "chat" + string(t.ChatID)
 		in.Resolver.Put(d, ChatMeta{Title: t.Title, TaskID: t.ID.Int(), TaskTitle: t.Title, TaskRole: t.Role(me)})
-		dialogs[d] = true
+		dialogs[d] = false
 	}
 	n := 0
-	for d := range dialogs {
+	for d, personalOnly := range dialogs {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		h, err := in.Portal.DialogHistory(ctx, d, 30)
+		added, err := in.backfillDialog(ctx, d, since, personalOnly)
+		n += added
 		if err != nil {
-			in.Log.Warn("inbox: history", "dialog", d, "err", err)
-			continue
-		}
-		meta, err := in.Resolver.Meta(ctx, d)
-		if err != nil {
-			meta = ChatMeta{Private: IsPrivateDialog(d)}
-		}
-		var lastMine int64
-		for _, m := range h.Messages {
-			if m.AuthorID == me && m.ID > lastMine {
-				lastMine = m.ID
-			}
-		}
-		refs, err := in.Portal.ReplyRefs(ctx, d, 50)
-		if err != nil {
-			in.Log.Warn("inbox: replies", "dialog", d, "err", err)
-		}
-		for _, m := range h.Messages {
-			if m.ID <= lastMine {
-				continue
-			}
-			if t, err := time.Parse(time.RFC3339, m.Date); err == nil && t.Before(since) {
-				continue
-			}
-			if in.Filter.Skip(m.AuthorID, h.IsBot(m.AuthorID), m.Text) != "" {
-				continue
-			}
-			var ref *bitrix.ReplyRef
-			if r, ok := refs[m.ID]; ok {
-				ref = &r
-			}
-			reply, replyToMe := in.resolveReply(ctx, d, ref)
-			labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, replyToMe, meta, me, in.Filter.IncludeSystem)
-			if len(labels) == 0 {
-				continue
-			}
-			it := Item{
-				MessageID: m.ID, DialogID: d, ChatID: h.ChatID.Int(), SenderID: m.AuthorID,
-				SenderName: h.UserName(m.AuthorID), Text: withAttachment(PlainText(m.Text), hasFiles(m.Params)), Date: m.Date,
-				Labels: labels, ChatTitle: meta.Title, TaskID: meta.TaskID, TaskTitle: meta.TaskTitle,
-			}
-			it.setReply(reply)
-			added, err := in.add(ctx, &it)
-			if err != nil {
-				return err
-			}
-			if added {
-				n++
-			}
+			return err
 		}
 	}
 	in.Log.Info("inbox: backfill done", "dialogs", len(dialogs), "items", n)
 	return nil
+}
+
+func (in *Inbox) backfillDialog(ctx context.Context, d string, since time.Time, personalOnly bool) (int, error) {
+	me := in.Me()
+	h, err := in.Portal.DialogHistory(ctx, d, 50)
+	if err != nil {
+		in.Log.Warn("inbox: history", "dialog", d, "err", err)
+		return 0, nil
+	}
+	private := IsPrivateDialog(d)
+	var lastMine int64
+	for _, m := range h.Messages {
+		if m.AuthorID == me && m.ID > lastMine {
+			lastMine = m.ID
+		}
+	}
+	var todo []bitrix.HistoryMessage
+	for _, m := range h.Messages {
+		if m.AuthorID == me || (private && m.ID <= lastMine) {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, m.Date); err == nil && t.Before(since) {
+			continue
+		}
+		if m.AuthorID == 0 && !in.Filter.IncludeSystem {
+			continue
+		}
+		if in.Filter.Skip(m.AuthorID, h.IsBot(m.AuthorID), m.Text) != "" {
+			continue
+		}
+		if _, known, err := in.Store.ByMessage(ctx, m.ID); err != nil {
+			return 0, err
+		} else if known {
+			continue
+		}
+		todo = append(todo, m)
+	}
+	if len(todo) == 0 {
+		return 0, nil // no further requests for this dialog
+	}
+	meta, err := in.Resolver.Meta(ctx, d)
+	if err != nil {
+		meta = ChatMeta{Private: private}
+	}
+	refs, err := in.Portal.ReplyRefs(ctx, d, 50)
+	if err != nil {
+		in.Log.Warn("inbox: replies", "dialog", d, "err", err)
+	}
+	answered := map[int64]bool{} // messages I quoted in an answer
+	for _, m := range h.Messages {
+		if r, ok := refs[m.ID]; ok && m.AuthorID == me {
+			answered[r.ID] = true
+		}
+	}
+	n := 0
+	for _, m := range todo {
+		var ref *bitrix.ReplyRef
+		if r, ok := refs[m.ID]; ok {
+			ref = &r
+		}
+		reply, replyToMe := in.resolveReply(ctx, d, ref)
+		labels := Labels(d, m.AuthorID, m.Text, m.AuthorID == 0, replyToMe, meta, me, in.Filter.IncludeSystem)
+		personal := slices.Contains(labels, LabelMention) || slices.Contains(labels, LabelReply)
+		switch {
+		case len(labels) == 0, personalOnly && !personal:
+			continue
+		case !private && personal && answered[m.ID], !private && !personal && m.ID <= lastMine:
+			continue // already answered
+		}
+		it := Item{
+			MessageID: m.ID, DialogID: d, ChatID: h.ChatID.Int(), SenderID: m.AuthorID,
+			SenderName: h.UserName(m.AuthorID), Text: withAttachment(PlainText(m.Text), hasFiles(m.Params)), Date: m.Date,
+			Labels: labels, ChatTitle: meta.Title, TaskID: meta.TaskID, TaskTitle: meta.TaskTitle,
+		}
+		it.setReply(reply)
+		added, err := in.add(ctx, &it)
+		if err != nil {
+			return n, err
+		}
+		if added {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // --- reply drafts approved from the self chat ---
@@ -323,10 +445,7 @@ func (in *Inbox) Approve(ctx context.Context, id int64, newText string) error {
 		return err
 	}
 	_, _ = in.Store.MoveDraft(ctx, id, "sending", "sent", "", "", msgID)
-	if d.InboxID > 0 {
-		_, _ = in.Store.Done(ctx, []int64{d.InboxID})
-	}
-	_ = in.Store.DoneDialog(ctx, d.DialogID)
+	in.closeAnswered(ctx, d.DialogID, d.InboxID)
 	in.notify(ctx, fmt.Sprintf("✅ #%d отправлен.", id))
 	return nil
 }
@@ -359,9 +478,7 @@ func (in *Inbox) RecoverSending(ctx context.Context) error {
 		}
 		if sentID > 0 {
 			_, _ = in.Store.MoveDraft(ctx, d.ID, "sending", "sent", "", "recovered after restart", sentID)
-			if d.InboxID > 0 {
-				_, _ = in.Store.Done(ctx, []int64{d.InboxID})
-			}
+			in.closeAnswered(ctx, d.DialogID, d.InboxID)
 			continue
 		}
 		_, _ = in.Store.MoveDraft(ctx, d.ID, "sending", "failed", "", "interrupted, not found in the dialog", 0)
@@ -381,11 +498,30 @@ func (in *Inbox) Reject(ctx context.Context, id int64) error {
 	return nil
 }
 
-// SendNow sends without approval (AGENT_SEND_MODE=direct) and closes the dialog's items.
-func (in *Inbox) SendNow(ctx context.Context, dialogID, text string) (int64, error) {
+// closeAnswered closes what a sent message answers: everything in a private
+// chat; in a group the given item with its sender's earlier messages.
+func (in *Inbox) closeAnswered(ctx context.Context, dialogID string, inboxID int64) {
+	var err error
+	if IsPrivateDialog(dialogID) {
+		err = in.Store.DoneDialog(ctx, dialogID)
+	}
+	if inboxID > 0 {
+		it, e := in.Store.Get(ctx, inboxID)
+		if e == nil && it.DialogID == dialogID {
+			e = in.Store.DoneBurst(ctx, it)
+		}
+		err = errors.Join(err, e)
+	}
+	if err != nil {
+		in.Log.Warn("inbox: close answered", "dialog", dialogID, "inbox_id", inboxID, "err", err)
+	}
+}
+
+// SendNow sends without approval (AGENT_SEND_MODE=direct).
+func (in *Inbox) SendNow(ctx context.Context, dialogID, text string, inboxID int64) (int64, error) {
 	id, err := in.Portal.SendMessage(ctx, dialogID, text)
 	if err == nil {
-		_ = in.Store.DoneDialog(ctx, dialogID)
+		in.closeAnswered(ctx, dialogID, inboxID)
 	}
 	return id, err
 }

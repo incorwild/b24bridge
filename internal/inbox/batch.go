@@ -176,11 +176,17 @@ func MakeBatch(items []Item) Batch {
 			}
 		}
 		who := nonEmpty(it.SenderName, "участник")
-		if who == prev {
-			lines = append(lines, it.Text)
-		} else {
-			lines = append(lines, who+": "+it.Text)
+		line := it.Text
+		if it.Edited {
+			line = "(исправлено) " + line
 		}
+		if it.ReplyToText != "" {
+			line = "(в ответ на «" + excerpt(it.ReplyToText, 120) + "») " + line
+		}
+		if who != prev {
+			line = who + ": " + line
+		}
+		lines = append(lines, line)
 		prev = who
 	}
 	for i, l := range lines {

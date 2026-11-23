@@ -29,8 +29,10 @@ type Item struct {
 	// ReplyToID/ReplyToText: the message this one replies to.
 	ReplyToID   int64  `json:"reply_to_id,omitempty"`
 	ReplyToText string `json:"reply_to_text,omitempty"`
-	Status      string `json:"status"` // new | done
-	CreatedAt   string `json:"created_at"`
+	// Edited: the sender changed the text after it first arrived.
+	Edited    bool   `json:"edited,omitempty"`
+	Status    string `json:"status"` // new | done
+	CreatedAt string `json:"created_at"`
 	// Batched is set once the item went out in an inbox.batch webhook.
 	Batched bool `json:"-"`
 }
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS drafts (
 		`batched INTEGER NOT NULL DEFAULT 0`, // already sent in an inbox.batch
 		`reply_to_id INTEGER NOT NULL DEFAULT 0`,
 		`reply_to_text TEXT NOT NULL DEFAULT ''`,
+		`edited INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(`ALTER TABLE items ADD COLUMN ` + col); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column") {
@@ -127,7 +130,7 @@ func (s *Store) Add(ctx context.Context, it *Item) (bool, error) {
 	return true, nil
 }
 
-const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, batched, reply_to_id, reply_to_text`
+const itemCols = `id, message_id, dialog_id, chat_id, sender_id, sender_name, text, date, labels, chat_title, task_id, task_title, status, created_at, batched, reply_to_id, reply_to_text, edited`
 
 func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var it Item
@@ -135,7 +138,7 @@ func scanItem(r interface{ Scan(...any) error }) (Item, error) {
 	var chatID, taskID sql.NullInt64
 	var name, title, ttitle sql.NullString
 	err := r.Scan(&it.ID, &it.MessageID, &it.DialogID, &chatID, &it.SenderID, &name, &it.Text, &it.Date,
-		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt, &it.Batched, &it.ReplyToID, &it.ReplyToText)
+		&labels, &title, &taskID, &ttitle, &it.Status, &it.CreatedAt, &it.Batched, &it.ReplyToID, &it.ReplyToText, &it.Edited)
 	it.ChatID, it.TaskID = chatID.Int64, taskID.Int64
 	it.SenderName, it.ChatTitle, it.TaskTitle = name.String, title.String, ttitle.String
 	it.Labels = []string{}
@@ -231,6 +234,48 @@ func (s *Store) Done(ctx context.Context, ids []int64) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// DoneConversation closes a group chat's items that are not addressed to the
+// user personally (task chat talk). Mentions and replies stay: writing
+// something in a group does not answer everybody in it.
+func (s *Store) DoneConversation(ctx context.Context, dialogID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE items SET status='done', done_at=? WHERE status='new' AND dialog_id=?
+ AND labels NOT LIKE '%`+LabelMention+`%' AND labels NOT LIKE '%`+LabelReply+`%'`, now(), dialogID)
+	return err
+}
+
+// DoneMessages closes the items of the given Bitrix24 messages.
+func (s *Store) DoneMessages(ctx context.Context, messageIDs ...int64) error {
+	for _, id := range messageIDs {
+		if _, err := s.db.ExecContext(ctx, `UPDATE items SET status='done', done_at=? WHERE status='new' AND message_id=?`, now(), id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DoneBurst closes an item and the same sender's earlier items in that dialog:
+// one answer covers the whole burst.
+func (s *Store) DoneBurst(ctx context.Context, it Item) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE items SET status='done', done_at=? WHERE status='new' AND dialog_id=? AND sender_id=? AND message_id<=?`,
+		now(), it.DialogID, it.SenderID, it.MessageID)
+	return err
+}
+
+// ByMessage finds the item of a Bitrix24 message; ok=false if there is none.
+func (s *Store) ByMessage(ctx context.Context, messageID int64) (Item, bool, error) {
+	it, err := scanItem(s.db.QueryRowContext(ctx, `SELECT `+itemCols+` FROM items WHERE message_id = ?`, messageID))
+	if err == sql.ErrNoRows {
+		return it, false, nil
+	}
+	return it, err == nil, err
+}
+
+// Edit replaces an item's text and lets it go out to the agent again.
+func (s *Store) Edit(ctx context.Context, id int64, text string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE items SET text=?, edited=1, batched=0 WHERE id=? AND status='new'`, text, id)
+	return err
 }
 
 // DoneDialog marks every new item of a dialog as handled (after a reply).

@@ -53,18 +53,20 @@ type Event struct {
 }
 
 type Payload struct {
-	DialogID  string `json:"dialog_id,omitempty"`
-	ChatID    int64  `json:"chat_id,omitempty"`
-	MessageID int64  `json:"message_id,omitempty"`
-	SenderID  int64  `json:"sender_id,omitempty"`
-	IsFromMe  bool   `json:"is_from_me"`
-	System    bool   `json:"system,omitempty"`
-	Text      string `json:"text,omitempty"`
-	Date      string `json:"date,omitempty"`
-	Reaction  string `json:"reaction,omitempty"`
-	UserID    int64  `json:"user_id,omitempty"` // reactor / reader / typer
-	UserName  string `json:"user_name,omitempty"`
-	LastID    int64  `json:"last_id,omitempty"` // read pointer
+	DialogID string `json:"dialog_id,omitempty"`
+	ChatID   int64  `json:"chat_id,omitempty"`
+	// MessageIDs lists every message of a deletion (messageDeleteV2 can carry several).
+	MessageIDs []int64 `json:"message_ids,omitempty"`
+	MessageID  int64   `json:"message_id,omitempty"`
+	SenderID   int64   `json:"sender_id,omitempty"`
+	IsFromMe   bool    `json:"is_from_me"`
+	System     bool    `json:"system,omitempty"`
+	Text       string  `json:"text,omitempty"`
+	Date       string  `json:"date,omitempty"`
+	Reaction   string  `json:"reaction,omitempty"`
+	UserID     int64   `json:"user_id,omitempty"` // reactor / reader / typer
+	UserName   string  `json:"user_name,omitempty"`
+	LastID     int64   `json:"last_id,omitempty"` // read pointer
 	// Viewed lists the message ids this read marked as viewed.
 	Viewed []int64 `json:"viewed_messages,omitempty"`
 	// Status is Bitrix's chatMessageStatus on read receipts (e.g. "delivered").
@@ -99,6 +101,7 @@ var commandEvents = map[string]string{
 	"messageUpdate":           EvMessageEdited,
 	"messageDelete":           EvMessageDeleted,
 	"messageDeleteComplete":   EvMessageDeleted,
+	"messageDeleteV2":         EvMessageDeleted,
 	"addReaction":             EvReaction,
 	"deleteReaction":          EvReaction,
 	"readMessage":             EvChatRead,
@@ -130,6 +133,7 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		MsgStatus  string          `json:"chatMessageStatus"`
 		Text       string          `json:"text"`
 		Reaction   string          `json:"reaction"`
+		Messages   json.RawMessage `json:"messages"` // messageDeleteV2
 		LastID     ID              `json:"lastId"`
 		Files      json.RawMessage `json:"files"`
 		Message    *struct {
@@ -182,6 +186,23 @@ func Normalize(pm PullMessage, me int64) (Event, bool) {
 		pl.MessageID = p.ID.Int()
 		pl.SenderID = firstNonZero(p.SenderID.Int(), p.FromUserID.Int())
 		pl.Text = p.Text
+		if name == EvMessageDeleted {
+			if pl.MessageID != 0 {
+				pl.MessageIDs = []int64{pl.MessageID}
+			}
+			var ms []struct {
+				ID ID `json:"id"`
+			}
+			_ = json.Unmarshal(p.Messages, &ms)
+			for _, m := range ms {
+				if n := m.ID.Int(); n != 0 && n != pl.MessageID {
+					pl.MessageIDs = append(pl.MessageIDs, n)
+				}
+			}
+			if pl.MessageID == 0 && len(pl.MessageIDs) > 0 {
+				pl.MessageID = pl.MessageIDs[0]
+			}
+		}
 	case EvReaction:
 		pl.UserID = p.UserID.Int()
 		pl.Reaction = p.Reaction
